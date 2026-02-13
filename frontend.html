@@ -127,13 +127,14 @@
         };
 
         // Token helpers
+        const TOKEN_MAX_AGE = 9 * 60 * 60 * 1000;
         function generateToken(username, role) {
             return btoa(`${username}:${Date.now()}:${role}`);
         }
         function parseToken(token) {
             try {
                 const [username, ts, role] = atob(token).split(':');
-                if (Date.now() - parseInt(ts) > 86400000) return null;
+                if (Date.now() - parseInt(ts) > TOKEN_MAX_AGE) return null;
                 return { username, role };
             } catch { return null; }
         }
@@ -1759,12 +1760,44 @@
                 }
 
                 const now = new Date().toISOString();
+                const wasBacklog = (todo.task_status || 'todo') === 'backlog';
+                
                 await directDB.update('todos', {
                     task_status: 'in_progress',
                     completed: false,
                     completed_at: null,
                     updated_at: now
                 }, { id: todoId });
+
+                // If coming from backlog, also record acknowledgement
+                if (wasBacklog) {
+                    await this.addTaskHistoryEntry(todoId, {
+                        type: 'acknowledged',
+                        user: user.username,
+                        details: `${user.username} acknowledged the task assignment`,
+                        timestamp: now,
+                        icon: '✅',
+                        title: 'Task Acknowledged'
+                    }, token);
+
+                    // Notify task creator about acknowledgement
+                    if (todo.username && todo.username !== user.username) {
+                        await this.createNotification({
+                            userId: todo.username,
+                            type: 'task_assigned',
+                            title: 'Task Acknowledged & Started',
+                            message: `${user.username} acknowledged and started task "${todo.title || 'Untitled'}".`,
+                            link: `todo:${todoId}`,
+                            createdBy: user.username,
+                            metadata: {
+                                todoId: todoId,
+                                todoTitle: todo.title,
+                                acknowledged: true,
+                                started: true
+                            }
+                        });
+                    }
+                }
 
                 await this.addTaskHistoryEntry(todoId, {
                     type: 'started',
@@ -8352,9 +8385,6 @@
                                             <button onclick="document.getElementById('todoAttachmentInput').click()"
                                                 class="btn btn-secondary" style="padding: 8px 16px; font-size: 14px;">➕ Add
                                                 Attachment</button>
-                                            <button id="fixAttachmentPermissionsBtn" onclick="fixAttachmentPermissions()" 
-                                                class="btn" style="padding: 8px 12px; font-size: 12px; background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; display: none;"
-                                                title="Fix sharing permissions for all attachments">🔧 Fix Access</button>
                                         </div>
                                         <input type="file" id="todoAttachmentInput" style="display: none;" multiple
                                             accept="*/*" onchange="handleAttachmentUpload(event)" />
@@ -9614,8 +9644,8 @@
             }
 
             // ================================================================
-            // SESSION STORAGE - Persist login across page refreshes
-            // Uses sessionStorage = clears when tab/browser closes
+            // SESSION STORAGE - Persist login across refresh + tab/browser close
+            // Uses localStorage = survives tab close, expires in 9 hours
             // ================================================================
             const SESSION_STORAGE_KEY = 'gas_portal_session';
             const SESSION_MAX_AGE = 9 * 60 * 60 * 1000; // 9 hours in milliseconds
@@ -9627,17 +9657,18 @@
                         user: currentUser,
                         timestamp: Date.now()
                     };
-                    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+                    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
                 }
             }
 
             function clearSession() {
+                localStorage.removeItem(SESSION_STORAGE_KEY);
                 sessionStorage.removeItem(SESSION_STORAGE_KEY);
             }
 
             function restoreSession() {
                 try {
-                    const stored = sessionStorage.getItem(SESSION_STORAGE_KEY);
+                    const stored = localStorage.getItem(SESSION_STORAGE_KEY) || sessionStorage.getItem(SESSION_STORAGE_KEY);
                     if (!stored) return false;
 
                     const session = JSON.parse(stored);
@@ -10393,49 +10424,37 @@
                 try {
                     // Create audio context for notification sound
                     const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    const oscillator = audioContext.createOscillator();
-                    const gainNode = audioContext.createGain();
+                    if (audioContext.state === 'suspended') {
+                        audioContext.resume().catch(() => {});
+                    }
 
-                    // Connect nodes
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
+                    const playTone = (startOffset, fromFreq, toFreq, peakGain, duration, type = 'triangle') => {
+                        const osc = audioContext.createOscillator();
+                        const gain = audioContext.createGain();
 
-                    // Configure sound - pleasant notification chime (two-tone)
-                    // First tone
-                    oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
-                    oscillator.frequency.exponentialRampToValueAtTime(1000, audioContext.currentTime + 0.1);
+                        osc.type = type;
+                        osc.connect(gain);
+                        gain.connect(audioContext.destination);
 
-                    // Volume envelope - quick fade in/out
-                    gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-                    gainNode.gain.linearRampToValueAtTime(0.25, audioContext.currentTime + 0.01);
-                    gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.12);
+                        const start = audioContext.currentTime + startOffset;
+                        const attackEnd = start + 0.015;
+                        const end = start + duration;
 
-                    // Play first tone
-                    oscillator.start(audioContext.currentTime);
-                    oscillator.stop(audioContext.currentTime + 0.12);
+                        osc.frequency.setValueAtTime(fromFreq, start);
+                        osc.frequency.exponentialRampToValueAtTime(toFreq, end);
 
-                    // Second tone after a brief pause
-                    setTimeout(() => {
-                        try {
-                            const oscillator2 = audioContext.createOscillator();
-                            const gainNode2 = audioContext.createGain();
+                        gain.gain.setValueAtTime(0.0001, start);
+                        gain.gain.linearRampToValueAtTime(peakGain, attackEnd);
+                        gain.gain.exponentialRampToValueAtTime(0.0001, end);
 
-                            oscillator2.connect(gainNode2);
-                            gainNode2.connect(audioContext.destination);
+                        osc.start(start);
+                        osc.stop(end);
+                    };
 
-                            oscillator2.frequency.setValueAtTime(1000, audioContext.currentTime);
-                            oscillator2.frequency.exponentialRampToValueAtTime(1200, audioContext.currentTime + 0.08);
-
-                            gainNode2.gain.setValueAtTime(0, audioContext.currentTime);
-                            gainNode2.gain.linearRampToValueAtTime(0.2, audioContext.currentTime + 0.01);
-                            gainNode2.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.1);
-
-                            oscillator2.start(audioContext.currentTime);
-                            oscillator2.stop(audioContext.currentTime + 0.1);
-                        } catch (e) {
-                            // Ignore second tone errors
-                        }
-                    }, 120);
+                    // Louder 3-tone notification chime
+                    playTone(0.00, 880, 1120, 0.45, 0.14, 'triangle');
+                    playTone(0.11, 1120, 1320, 0.42, 0.12, 'triangle');
+                    playTone(0.21, 1320, 1560, 0.36, 0.11, 'sine');
                 } catch (error) {
                     // Fallback: Simple beep if Web Audio API fails
                     try {
@@ -10447,12 +10466,12 @@
                         gainNode.connect(audioContext.destination);
 
                         oscillator.type = 'sine';
-                        oscillator.frequency.value = 800;
-                        gainNode.gain.setValueAtTime(0.15, audioContext.currentTime);
-                        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.15);
+                        oscillator.frequency.value = 980;
+                        gainNode.gain.setValueAtTime(0.28, audioContext.currentTime);
+                        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.22);
 
                         oscillator.start(audioContext.currentTime);
-                        oscillator.stop(audioContext.currentTime + 0.15);
+                        oscillator.stop(audioContext.currentTime + 0.22);
                     } catch (e) {
                         console.log('Sound notification not supported:', e);
                     }
@@ -11597,12 +11616,12 @@
             }
 
             // ================================================================
-            // AUTO-LOGIN FROM SESSION STORAGE ON PAGE LOAD
+            // AUTO-LOGIN FROM LOCAL SESSION ON PAGE LOAD
             // ================================================================
             window.addEventListener('load', function () {
                 // Browser notifications removed - using portal notifications only
 
-                // Try to restore session from sessionStorage
+                // Try to restore session from localStorage
                 if (restoreSession()) {
                     console.log('🔐 Auto-login: Restoring previous session...');
 
@@ -18584,8 +18603,8 @@
 
                 <!-- Actions -->
                 <div style="display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap;">
-                    ${isMainAssignee && !isMainTaskCreator && !todo.completed && workflowStatus === 'backlog' ? `<button onclick="acknowledgeTaskAssignment('${todo.id}')" style="background: #f59e0b; color: white; border: none; border-radius: 10px; padding: 0 12px; height: 36px; cursor: pointer; font-size: 12px; font-weight: 700;">Acknowledge</button>` : ''}
-                    ${isMainAssignee && !isMainTaskCreator && !todo.completed && (workflowStatus === 'todo' || workflowStatus === 'backlog') ? `<button onclick="startTaskWork('${todo.id}')" style="background: #10b981; color: white; border: none; border-radius: 10px; padding: 0 12px; height: 36px; cursor: pointer; font-size: 12px; font-weight: 700;">Start</button>` : ''}
+                    ${isMainAssignee && !todo.completed && workflowStatus === 'backlog' ? `<button onclick="acknowledgeTaskAssignment('${todo.id}')" style="background: #f59e0b; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(245,158,11,0.3);" onmouseover="this.style.background='#d97706'; this.style.transform='scale(1.02)';" onmouseout="this.style.background='#f59e0b'; this.style.transform='scale(1)';">✅ Acknowledge</button>` : ''}
+                    ${isMainAssignee && !todo.completed && (workflowStatus === 'backlog' || workflowStatus === 'todo') ? `<button onclick="startTaskWork('${todo.id}')" style="background: #10b981; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(16,185,129,0.3);" onmouseover="this.style.background='#059669'; this.style.transform='scale(1.02)';" onmouseout="this.style.background='#10b981'; this.style.transform='scale(1)';">🚀 Start Task</button>` : ''}
                     <button onclick="openTodoDetail('${todo.id}')" style="background: #e0f2fe; border: none; width: 36px; height: 36px; border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: all 0.2s;" onmouseover="this.style.background='#bae6fd';" onmouseout="this.style.background='#e0f2fe';" title="View Details">👁️</button>
                     ${canEdit ? `<button onclick="editTodo('${todo.id}')" style="background: #f1f5f9; border: none; width: 36px; height: 36px; border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: all 0.2s;" onmouseover="this.style.background='#e2e8f0';" onmouseout="this.style.background='#f1f5f9';" title="Edit">✏️</button>` : `<div style="width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; opacity: 0.5; cursor: not-allowed; background: #f1f5f9;" title="Cannot edit - pending manager approval">✏️</div>`}
                     <button onclick="duplicateTodo('${todo.id}')" style="background: #f0f9ff; border: none; width: 36px; height: 36px; border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: all 0.2s;" onmouseover="this.style.background='#dbeafe';" onmouseout="this.style.background='#f0f9ff';" title="Duplicate">📋</button>
@@ -18798,6 +18817,8 @@
                         </div>
                     </div>
                     <div class="kanban-task-actions">
+                        ${todo.assigned_to === currentUser?.username && !todo.completed && (todo.task_status === 'backlog') ? `<button onclick="acknowledgeTaskAssignment('${todo.id}')" class="kanban-task-action-btn" style="background: #f59e0b; color: white; font-weight: 700;">✅ Ack</button>` : ''}
+                        ${todo.assigned_to === currentUser?.username && !todo.completed && (todo.task_status === 'backlog' || todo.task_status === 'todo' || !todo.task_status) ? `<button onclick="startTaskWork('${todo.id}')" class="kanban-task-action-btn" style="background: #10b981; color: white; font-weight: 700;">🚀 Start</button>` : ''}
                         <button onclick="openTodoDetail('${todo.id}')" class="kanban-task-action-btn view">View</button>
                         ${todo.username === currentUser?.username ? `<button onclick="editTodo('${todo.id}')" class="kanban-task-action-btn edit">Edit</button>` : ''}
                     </div>
@@ -20295,13 +20316,13 @@
                                     })()}
                                 </div>
 
-                                ${details.assigned_to === currentUser?.username && details.username !== currentUser?.username && !details.completed ? `
+                                ${details.assigned_to === currentUser?.username && !details.completed ? `
                                     <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                                         ${(details.task_status || 'todo') === 'backlog' ? `
-                                            <button onclick="acknowledgeTaskAssignment('${details.id}')" style="padding: 10px 14px; border: none; border-radius: 8px; background: #f59e0b; color: white; font-weight: 700; cursor: pointer;">✅ Acknowledge Task</button>
+                                            <button onclick="acknowledgeTaskAssignment('${details.id}')" style="padding: 10px 14px; border: none; border-radius: 8px; background: #f59e0b; color: white; font-weight: 700; cursor: pointer; box-shadow: 0 2px 4px rgba(245,158,11,0.3);">✅ Acknowledge Task</button>
                                         ` : ''}
-                                        ${(details.task_status || 'todo') === 'todo' ? `
-                                            <button onclick="startTaskWork('${details.id}')" style="padding: 10px 14px; border: none; border-radius: 8px; background: #10b981; color: white; font-weight: 700; cursor: pointer;">🚀 Start Task</button>
+                                        ${(details.task_status || 'todo') === 'todo' || (details.task_status || 'todo') === 'backlog' ? `
+                                            <button onclick="startTaskWork('${details.id}')" style="padding: 10px 14px; border: none; border-radius: 8px; background: #10b981; color: white; font-weight: 700; cursor: pointer; box-shadow: 0 2px 4px rgba(16,185,129,0.3);">🚀 Start Task</button>
                                         ` : ''}
                                     </div>
                                 ` : ''}
@@ -21012,13 +21033,6 @@
                 const container = document.getElementById('attachmentsContainer');
                 if (!container) return;
                 container.innerHTML = '';
-                
-                // Show/hide Fix Access button for Managers
-                const fixBtn = document.getElementById('fixAttachmentPermissionsBtn');
-                if (fixBtn) {
-                    const isManager = currentUser && (currentUser.role === 'Manager' || currentUser.role === 'Super Manager');
-                    fixBtn.style.display = isManager ? 'inline-block' : 'none';
-                }
 
                 if (attachments.length === 0) {
                     container.innerHTML = '<p style="color: #64748b; text-align: center; padding: 20px;">No attachments yet</p>';
@@ -21224,45 +21238,6 @@
                     .deleteTodoAttachment(attachmentId, token);
             }
             
-            // Fix sharing permissions for all task attachments (Manager only)
-            function fixAttachmentPermissions() {
-                if (!confirm('This will make all task attachments viewable by anyone with the link. Continue?')) return;
-                
-                const token = authToken;
-                if (!token) return;
-                
-                const btn = document.getElementById('fixAttachmentPermissionsBtn');
-                if (btn) {
-                    btn.disabled = true;
-                    btn.innerHTML = '⏳ Fixing...';
-                }
-                
-                google.script.run
-                    .withSuccessHandler(function (result) {
-                        if (btn) {
-                            btn.disabled = false;
-                            btn.innerHTML = '🔧 Fix Access';
-                        }
-                        
-                        if (result && result.success) {
-                            showToast(`Fixed permissions for ${result.fixed} attachment(s)!`, 'success');
-                            if (result.errors && result.errors.length > 0) {
-                                console.warn('Some files could not be fixed:', result.errors);
-                            }
-                        } else {
-                            showToast('Failed to fix permissions: ' + (result?.error || 'Unknown error'), 'error');
-                        }
-                    })
-                    .withFailureHandler(function (error) {
-                        if (btn) {
-                            btn.disabled = false;
-                            btn.innerHTML = '🔧 Fix Access';
-                        }
-                        showToast('Failed to fix permissions: ' + error.message, 'error');
-                    })
-                    .fixAllTaskAttachmentPermissions(token);
-            }
-
             // Sharing Functions
             function renderShares(shares, taskDetails) {
                 const container = document.getElementById('sharesContainer');
