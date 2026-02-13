@@ -1420,6 +1420,15 @@
                 if (!user) throw new Error('Unauthorized');
 
                 const now = new Date().toISOString();
+                
+                // For edits, get existing task once (reused below for permission check and status preservation)
+                let existingTodo = null;
+                if (todoData.id) {
+                    const existing = await directDB.select('todos', { id: todoData.id });
+                    if (!existing?.length) throw new Error('Todo not found');
+                    existingTodo = existing[0];
+                }
+                
                 const payload = {
                     id: todoData.id || crypto.randomUUID(),
                     ...(todoData.id ? {} : { username: user.username }),
@@ -1427,7 +1436,7 @@
                     description: todoData.description || '',
                     our_goal: todoData.our_goal || '',
                     completed: todoData.completed || false,
-                    task_status: todoData.task_status || 'todo',
+                    task_status: todoData.task_status || (existingTodo?.task_status || 'todo'),
                     priority: todoData.priority || 'medium',
                     category: todoData.category || 'automation_development',
                     due_date: todoData.due_date || null,
@@ -1449,10 +1458,7 @@
                     }
                 } else {
                     // ONLY the main task creator can edit task information
-                    const existing = await directDB.select('todos', { id: todoData.id });
-                    if (!existing?.length) throw new Error('Todo not found');
-
-                    const todo = existing[0];
+                    const todo = existingTodo;
                     const isCreator = todo.username === user.username;
 
                     if (!isCreator) {
@@ -8225,7 +8231,7 @@
                                     </div>
                                 </div>
                                 <div
-                                    style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+                                    style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
                                     <div class="form-group">
                                         <label
                                             style="display: block; margin-bottom: 8px; color: #1E293B; font-weight: 700; font-size: 15px;">Priority</label>
@@ -8235,17 +8241,6 @@
                                             <option value="medium" selected>🔵 Medium</option>
                                             <option value="high">🟠 High</option>
                                             <option value="urgent">🔴 Urgent</option>
-                                        </select>
-                                    </div>
-                                    <div class="form-group">
-                                        <label
-                                            style="display: block; margin-bottom: 8px; color: #1E293B; font-weight: 700; font-size: 15px;">Task Status</label>
-                                        <select id="todoTaskStatus"
-                                            style="width: 100%; padding: 14px 18px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 15px; cursor: pointer;">
-                                            <option value="backlog">📋 Backlog</option>
-                                            <option value="todo" selected>📝 To Do</option>
-                                            <option value="in_progress">🔄 In Progress</option>
-                                            <option value="done">✅ Done</option>
                                         </select>
                                     </div>
                                     <div class="form-group">
@@ -19329,7 +19324,7 @@
                 if (titleText) titleText.textContent = 'Add New Task';
                 document.getElementById('todoForm').reset();
                 document.getElementById('todoId').value = '';
-                document.getElementById('todoTaskStatus').value = 'todo';
+                // Task status defaults to 'todo' (removed from form)
                 const ourGoalEditor = document.getElementById('todoOurGoal');
                 if (ourGoalEditor) {
                     ourGoalEditor.innerHTML = '';
@@ -19541,7 +19536,7 @@
                 document.getElementById('todoTitle').value = todo.title;
                 document.getElementById('todoDescription').value = todo.description || '';
                 document.getElementById('todoPriority').value = todo.priority;
-                document.getElementById('todoTaskStatus').value = todo.task_status || (todo.completed ? 'done' : 'todo');
+                // Task status preserved during edit (removed from form)
                 document.getElementById('todoCategory').value = todo.category;
 
                 if (todo.due_date) {
@@ -19613,7 +19608,8 @@
                     description: document.getElementById('todoDescription').value.trim(),
                     our_goal: ourGoal,
                     priority: document.getElementById('todoPriority').value,
-                    task_status: document.getElementById('todoTaskStatus').value,
+                    // task_status: only set for new tasks (backend preserves existing status for edits)
+                    ...(todoId ? {} : { task_status: 'todo' }),
                     category: document.getElementById('todoCategory').value,
                     due_date: document.getElementById('todoDueDate').value || null,
                     notes: document.getElementById('todoNotes').value.trim() || ''
