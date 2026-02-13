@@ -113,20 +113,55 @@ function hasCampaignAccess(user, campaignName) {
 // AUTHENTICATION
 // ============================================================================
 
+// Get the active Google account email of the user accessing the web app
+function getActiveUserEmail() {
+  try {
+    return Session.getActiveUser().getEmail() || '';
+  } catch(e) {
+    return '';
+  }
+}
+
 function login(username, password) {
   try {
+    console.log('Login attempt for username:', username);
+    
     // Get user by username only
     const users = supabaseRequest(`users?username=eq.${encodeURIComponent(username)}&select=*`, 'GET');
     
     if (users && users.length > 0) {
       const user = users[0];
+      console.log('User found:', user.username, 'Role:', user.role);
       
       // Verify password
       if (user.password !== password) {
+        console.log('Password mismatch for user:', username);
         return { success: false, error: 'Invalid username or password' };
       }
+      console.log('Password verified for user:', username);
 
-      // Email verification removed - no longer required for login
+      // Verify browser's Google account email matches user's registered email(s)
+      try {
+        const browserEmail = Session.getActiveUser().getEmail();
+        console.log('Browser email:', browserEmail);
+        console.log('Registered emails:', user.email);
+        
+        if (browserEmail) {
+          const registeredEmails = (user.email || '').split(',').map(function(e) { return e.trim().toLowerCase(); }).filter(function(e) { return e.includes('@'); });
+          console.log('Parsed registered emails:', registeredEmails);
+          
+          if (registeredEmails.length > 0 && !registeredEmails.includes(browserEmail.toLowerCase())) {
+            console.log('Email mismatch! Browser:', browserEmail, 'not in:', registeredEmails);
+            return { success: false, error: 'Your Google account (' + browserEmail + ') does not match your registered email(s). Please sign in with the correct Google account.' };
+          }
+          console.log('Email verified successfully');
+        } else {
+          console.log('No browser email available, skipping email check');
+        }
+      } catch(emailCheckError) {
+        // If Session.getActiveUser() is unavailable, skip email check
+        console.log('Email verification skipped: ' + emailCheckError.message);
+      }
       
       // Generate token
       const timestamp = new Date().getTime();

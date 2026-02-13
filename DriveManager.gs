@@ -606,6 +606,18 @@ function uploadFileToDrive(base64Data, fileName, mimeType, parentFolderId, token
     const file = parentFolder.createFile(blob);
     Logger.log('File created successfully: ' + file.getId() + ' in folder: ' + parentFolder.getName());
     
+    // For task attachments, set sharing to "Anyone with the link can view"
+    // This allows all users with task access to view the attachment without permission errors
+    if (isRootFolder || todoId) {
+      try {
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        Logger.log('Sharing set to "Anyone with link can view" for file: ' + file.getId());
+      } catch (shareError) {
+        Logger.log('Warning: Could not set sharing permissions: ' + shareError.message);
+        // Continue anyway - file was created successfully
+      }
+    }
+    
     return {
       success: true,
       file: {
@@ -619,6 +631,100 @@ function uploadFileToDrive(base64Data, fileName, mimeType, parentFolderId, token
   } catch (error) {
     Logger.log('Error in uploadFileToDrive: ' + error.message);
     Logger.log('Error stack: ' + error.stack);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Makes a file publicly accessible (anyone with link can view)
+ * Used to fix sharing permissions for task attachments
+ * @param {string} fileId - The file ID to make public
+ * @param {string} token - Auth token
+ * @return {Object} { success: boolean, url: string }
+ */
+function makeFilePublic(fileId, token) {
+  try {
+    const user = validateToken(token);
+    if (!user) {
+      throw new Error('Authentication required');
+    }
+    
+    const file = DriveApp.getFileById(fileId);
+    
+    // Set sharing to anyone with link can view
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    Logger.log('File ' + fileId + ' set to public by ' + user.username);
+    
+    return {
+      success: true,
+      url: file.getUrl()
+    };
+  } catch (error) {
+    Logger.log('Error making file public: ' + error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Fix sharing permissions for all attachments in the Task Attachments folder
+ * This is a one-time migration function for existing attachments
+ * @param {string} token - Auth token (must be Manager)
+ * @return {Object} { success: boolean, fixed: number, errors: Array }
+ */
+function fixAllTaskAttachmentPermissions(token) {
+  try {
+    const user = validateToken(token);
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) {
+      throw new Error('Manager access required');
+    }
+    
+    const folder = getOrCreateTaskAttachmentsFolder();
+    let fixed = 0;
+    const errors = [];
+    
+    // Process all files in the main folder
+    const files = folder.getFiles();
+    while (files.hasNext()) {
+      const file = files.next();
+      try {
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        fixed++;
+      } catch (e) {
+        errors.push({ file: file.getName(), error: e.message });
+      }
+    }
+    
+    // Process all subfolders (task-specific folders)
+    const subfolders = folder.getFolders();
+    while (subfolders.hasNext()) {
+      const subfolder = subfolders.next();
+      const subfiles = subfolder.getFiles();
+      while (subfiles.hasNext()) {
+        const file = subfiles.next();
+        try {
+          file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+          fixed++;
+        } catch (e) {
+          errors.push({ file: file.getName(), error: e.message });
+        }
+      }
+    }
+    
+    Logger.log('Fixed permissions for ' + fixed + ' files, ' + errors.length + ' errors');
+    
+    return {
+      success: true,
+      fixed: fixed,
+      errors: errors
+    };
+  } catch (error) {
     return {
       success: false,
       error: error.message

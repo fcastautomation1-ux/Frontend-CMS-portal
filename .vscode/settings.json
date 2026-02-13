@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^awk 'NR>=19787 && /\\\\\\*\\\\// \\{print NR\": \"\\$0; exit\\}' /workspaces/Frontend-CMS-portal/frontend\\.html$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python3 -c \"\nwith open\\('/workspaces/Frontend-CMS-portal/frontend\\.html'\\) as f:\n    lines = f\\.readlines\\(\\)\n# Find all /\\* and \\*/ in JS sections \\(after line 9000 to avoid CSS\\)\nfor i, line in enumerate\\(lines\\[9000:\\], start=9001\\):\n    stripped = line\\.strip\\(\\)\n    if '/\\*' in stripped and '\\*/' not in stripped and not stripped\\.startswith\\('//'\\):\n        print\\(f'OPEN  \\{i\\}: \\{stripped\\[:80\\]\\}'\\)\n    if '\\*/' in stripped and '/\\*' not in stripped:\n        print\\(f'CLOSE \\{i\\}: \\{stripped\\[:80\\]\\}'\\)\n    if '/\\*' in stripped and '\\*/' in stripped and not stripped\\.startswith\\('//'\\) and not '@' in stripped:\n        print\\(f'BOTH  \\{i\\}: \\{stripped\\[:80\\]\\}'\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
