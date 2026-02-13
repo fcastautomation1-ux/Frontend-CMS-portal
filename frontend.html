@@ -2287,6 +2287,11 @@
                 const isNewSubtask = !subtaskData.id;
                 const isCompleting = subtaskData.completed === true;
 
+                // Validate that new subtasks must have an assignee
+                if (isNewSubtask && (!subtaskData.assigned_to || subtaskData.assigned_to.trim() === '')) {
+                    throw new Error('Subtasks must be assigned to a team member');
+                }
+
                 // If completing a subtask, check if user is the assignee
                 if (isCompleting && !isNewSubtask) {
                     const existingSubtask = await directDB.select('todo_subtasks', { id: subtaskData.id });
@@ -2358,6 +2363,11 @@
                 // Handle assignment
                 if (subtaskData.assigned_to !== undefined) {
                     if (subtaskData.assigned_to && subtaskData.assigned_to !== '') {
+                        // Prevent self-assignment - user cannot assign subtask to themselves
+                        if (subtaskData.assigned_to.toLowerCase() === user.username.toLowerCase()) {
+                            throw new Error('You cannot assign a subtask to yourself. Please select another team member.');
+                        }
+                        
                         // Check if assigned user has a manager
                         const { data: assignedUser } = await client.from('users')
                             .select('manager_id')
@@ -8497,81 +8507,15 @@
                                     <div class="form-group" style="margin-bottom: 20px;">
                                         <label
                                             style="display: block; margin-bottom: 8px; color: #1E293B; font-weight: 700; font-size: 15px;">
-                                            Assign To (Optional)
+                                            Assign To <span style="color: #ef4444;">*</span>
                                         </label>
-                                        <select id="subtaskAssigneeSelect"
+                                        <select id="subtaskAssigneeSelect" required
                                             style="width: 100%; padding: 14px 18px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 15px; cursor: pointer;">
-                                            <option value="">-- No assignment (create unassigned) --</option>
+                                            <option value="">-- Select a team member --</option>
                                         </select>
                                         <small
                                             style="display: block; margin-top: 6px; color: #64748b; font-size: 13px;">
-                                            If assigned, manager approval will be required
-                                        </small>
-                                    </div>
-
-                                    <div style="display: flex; gap: 12px; margin-top: 24px;">
-                                        <button type="submit" class="btn btn-success"
-                                            style="flex: 1; padding: 14px 24px; font-size: 16px; font-weight: 600;">
-                                            💾 Create Subtask
-                                        </button>
-                                        <button type="button" onclick="closeAddSubtaskModal()" class="btn btn-secondary"
-                                            style="flex: 1; padding: 14px 24px; font-size: 16px; border-radius: 12px; background: white; border: 2px solid #e2e8f0; color: #475569; cursor: pointer; font-weight: 600;">
-                                            Cancel
-                                        </button>
-                                    </div>
-                                </form>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Add Subtask Modal -->
-                    <div id="addSubtaskModal" class="modal" style="display: none;">
-                        <div class="modal-content"
-                            style="max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto;">
-                            <div class="modal-header"
-                                style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; padding: 24px 30px;">
-                                <h3 style="margin: 0; font-size: 22px; font-weight: 700;">➕ Add Subtask</h3>
-                                <button class="close-btn" onclick="closeAddSubtaskModal()"
-                                    style="background: rgba(255,255,255,0.2); border: none; color: white; width: 36px; height: 36px; border-radius: 10px; font-size: 24px; cursor: pointer;">&times;</button>
-                            </div>
-                            <div style="padding: 30px;">
-                                <form id="addSubtaskForm" onsubmit="saveSubtaskFromModal(event)">
-                                    <div class="form-group" style="margin-bottom: 20px;">
-                                        <label
-                                            style="display: block; margin-bottom: 8px; color: #1E293B; font-weight: 700; font-size: 15px;">
-                                            Subtask Title <span style="color: #ef4444;">*</span>
-                                        </label>
-                                        <input type="text" id="subtaskTitleInput" required
-                                            placeholder="Enter subtask title (e.g., Design mockup, Code implementation, QA testing)"
-                                            style="width: 100%; padding: 14px 18px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 15px; outline: none; transition: border-color 0.2s;"
-                                            onfocus="this.style.borderColor='#6366f1';"
-                                            onblur="this.style.borderColor='#e2e8f0';" />
-                                    </div>
-
-                                    <div class="form-group" style="margin-bottom: 20px;">
-                                        <label
-                                            style="display: block; margin-bottom: 8px; color: #1E293B; font-weight: 700; font-size: 15px;">
-                                            Department
-                                        </label>
-                                        <select id="subtaskDepartmentSelect" onchange="filterSubtaskUsersByDepartment()"
-                                            style="width: 100%; padding: 14px 18px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 15px; cursor: pointer;">
-                                            <option value="">All Departments</option>
-                                            <!-- Will be populated with departments from database -->
-                                        </select>
-                                    </div>
-
-                                    <div class="form-group" style="margin-bottom: 20px;">
-                                        <label
-                                            style="display: block; margin-bottom: 8px; color: #1E293B; font-weight: 700; font-size: 15px;">
-                                            Assign To (Optional)
-                                        </label>
-                                        <select id="subtaskAssigneeSelect"
-                                            style="width: 100%; padding: 14px 18px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 15px; cursor: pointer;">
-                                            <option value="">-- No assignment (create unassigned) --</option>
-                                        </select>
-                                        <small
-                                            style="display: block; margin-top: 6px; color: #64748b; font-size: 13px;">
-                                            If assigned, manager approval will be required
+                                            Subtasks must be assigned to another team member for accountability
                                         </small>
                                     </div>
 
@@ -20939,13 +20883,20 @@
                     });
                 }
 
+                // Exclude current user - cannot assign subtask to yourself
+                if (currentUser && currentUser.username) {
+                    filteredUsers = filteredUsers.filter(user => 
+                        user.username.toLowerCase() !== currentUser.username.toLowerCase()
+                    );
+                }
+
                 // Update assignee dropdown
                 if (!filteredUsers || filteredUsers.length === 0) {
-                    assigneeSelect.innerHTML = '<option value="">-- No users available for this department --</option>';
+                    assigneeSelect.innerHTML = '<option value="">-- No other team members available --</option>';
                             return;
                         }
 
-                        assigneeSelect.innerHTML = '<option value="">-- No assignment (create unassigned) --</option>';
+                        assigneeSelect.innerHTML = '<option value="">-- Select a team member --</option>';
                 filteredUsers.forEach(user => {
                             const option = document.createElement('option');
                             option.value = user.username;
@@ -20976,13 +20927,28 @@
                     return;
                 }
 
-                const assignedTo = assigneeSelect.value.trim() || null;
+                const assignedTo = assigneeSelect.value.trim();
+                
+                // Validate assignment is required
+                if (!assignedTo) {
+                    showToast('Please select a team member to assign this subtask', 'error');
+                    assigneeSelect.focus();
+                    assigneeSelect.style.borderColor = '#ef4444';
+                    return;
+                }
+                
+                // Prevent self-assignment
+                if (currentUser && assignedTo.toLowerCase() === currentUser.username.toLowerCase()) {
+                    showToast('You cannot assign a subtask to yourself', 'error');
+                    return;
+                }
+
                 const token = authToken;
                 if (!token) return;
 
                 google.script.run
                     .withSuccessHandler(function () {
-                        showToast(assignedTo ? 'Subtask created and assigned! Manager approval pending.' : 'Subtask added!', 'success');
+                        showToast('Subtask created and assigned! Awaiting completion.', 'success');
                         closeAddSubtaskModal();
                         openTodoDetail(currentDetailTodoId);
                     })
@@ -21070,6 +21036,12 @@
                             showToast('User not found', 'error');
                             return;
                         }
+                        
+                        // Prevent self-assignment
+                        if (currentUser && selectedUser.toLowerCase() === currentUser.username.toLowerCase()) {
+                            showToast('You cannot assign a subtask to yourself', 'error');
+                            return;
+                        }
 
                         // Assign subtask
                         google.script.run
@@ -21112,6 +21084,12 @@
                         const userExists = users.find(u => u.username === selectedUser.trim());
                         if (!userExists) {
                             showToast('User not found', 'error');
+                            return;
+                        }
+                        
+                        // Prevent self-assignment
+                        if (currentUser && selectedUser.trim().toLowerCase() === currentUser.username.toLowerCase()) {
+                            showToast('You cannot reassign a task to yourself', 'error');
                             return;
                         }
 
