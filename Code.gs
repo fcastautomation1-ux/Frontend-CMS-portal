@@ -2033,3 +2033,127 @@ function removeAutomaticReminderTrigger() {
     };
   }
 }
+
+// ============================================================================
+// PACKAGE MANAGEMENT FUNCTIONS
+// ============================================================================
+
+/**
+ * Get all packages (Manager only)
+ */
+function getPackages(token) {
+  try {
+    const user = validateToken(token);
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    
+    const packages = supabaseRequest('packages?select=*&order=name.asc', 'GET');
+    return packages || [];
+  } catch (error) {
+    throw new Error('Failed to get packages: ' + error.message);
+  }
+}
+
+/**
+ * Add a new package (Manager only)
+ */
+function addPackage(packageData, token) {
+  try {
+    const user = validateToken(token);
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    
+    const payload = {
+      name: packageData.name.trim(),
+      description: (packageData.description || '').trim(),
+      created_by: user.username
+    };
+    
+    if (!payload.name) throw new Error('Package name is required');
+    
+    const result = supabaseRequest('packages', 'POST', payload);
+    return result;
+  } catch (error) {
+    throw new Error('Failed to add package: ' + error.message);
+  }
+}
+
+/**
+ * Delete a package (Manager only)
+ */
+function deletePackage(packageId, token) {
+  try {
+    const user = validateToken(token);
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    
+    supabaseRequest(`packages?id=eq.${encodeURIComponent(packageId)}`, 'DELETE');
+    return true;
+  } catch (error) {
+    throw new Error('Failed to delete package: ' + error.message);
+  }
+}
+
+/**
+ * Get all user-package assignments (Manager only)
+ */
+function getUserPackages(token) {
+  try {
+    const user = validateToken(token);
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    
+    const assignments = supabaseRequest('user_packages?select=*,packages(name)&order=username.asc', 'GET');
+    return assignments || [];
+  } catch (error) {
+    throw new Error('Failed to get user packages: ' + error.message);
+  }
+}
+
+/**
+ * Assign packages to a user (Manager only)
+ * @param {string} username - The user to assign packages to
+ * @param {string[]} packageIds - Array of package IDs to assign
+ */
+function assignPackagesToUser(username, packageIds, token) {
+  try {
+    const user = validateToken(token);
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    
+    // First, remove all existing assignments for this user
+    supabaseRequest(`user_packages?username=eq.${encodeURIComponent(username)}`, 'DELETE');
+    
+    // Then add new assignments
+    if (packageIds && packageIds.length > 0) {
+      const assignments = packageIds.map(pkgId => ({
+        username: username,
+        package_id: pkgId,
+        assigned_by: user.username
+      }));
+      
+      supabaseRequest('user_packages', 'POST', assignments);
+    }
+    
+    return true;
+  } catch (error) {
+    throw new Error('Failed to assign packages: ' + error.message);
+  }
+}
+
+/**
+ * Get packages assigned to the current user (for task creation dropdown)
+ */
+function getMyPackages(token) {
+  try {
+    const user = validateToken(token);
+    if (!user) throw new Error('Unauthorized');
+    
+    const assignments = supabaseRequest(
+      `user_packages?username=eq.${encodeURIComponent(user.username)}&select=package_id,packages(id,name)`,
+      'GET'
+    );
+    
+    return (assignments || []).map(a => ({
+      id: a.packages?.id || a.package_id,
+      name: a.packages?.name || 'Unknown'
+    }));
+  } catch (error) {
+    throw new Error('Failed to get assigned packages: ' + error.message);
+  }
+}

@@ -329,3 +329,46 @@ SELECT task_status, COUNT(*) as count
 FROM todos 
 GROUP BY task_status 
 ORDER BY task_status;
+
+-- ============================================================================
+-- 12. PACKAGE MANAGEMENT TABLES
+-- ============================================================================
+-- Packages feature allows managers to create package names and assign them
+-- to users. When creating tasks, users can select from their assigned packages.
+
+-- Packages table: stores all package names
+CREATE TABLE IF NOT EXISTS packages (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    created_by TEXT
+);
+
+-- User-Package assignments: maps users to their assigned packages
+CREATE TABLE IF NOT EXISTS user_packages (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    username TEXT NOT NULL,
+    package_id UUID NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+    assigned_at TIMESTAMPTZ DEFAULT NOW(),
+    assigned_by TEXT,
+    UNIQUE(username, package_id)
+);
+
+-- Create indexes for faster lookups
+CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);
+CREATE INDEX IF NOT EXISTS idx_user_packages_username ON user_packages(username);
+CREATE INDEX IF NOT EXISTS idx_user_packages_package_id ON user_packages(package_id);
+
+-- Add package_name column to todos table for task-level tracking
+ALTER TABLE todos ADD COLUMN IF NOT EXISTS package_name TEXT;
+CREATE INDEX IF NOT EXISTS idx_todos_package_name ON todos(package_name);
+
+-- View all packages
+-- SELECT * FROM packages ORDER BY name;
+
+-- View user-package assignments with package names
+-- SELECT up.username, p.name as package_name, up.assigned_at
+-- FROM user_packages up
+-- JOIN packages p ON up.package_id = p.id
+-- ORDER BY up.username, p.name;
