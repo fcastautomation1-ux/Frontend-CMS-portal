@@ -788,9 +788,10 @@ function renameDriveItem(itemId, newName, token) {
  * Deletes (moves to trash) a file or folder
  * @param {string} itemId - File or folder ID
  * @param {string} token - Auth token
+ * @param {boolean} allowTaskAttachmentDelete - Optional bypass for task attachments only
  * @return {Object} { success: boolean }
  */
-function deleteDriveItem(itemId, token) {
+function deleteDriveItem(itemId, token, allowTaskAttachmentDelete) {
   try {
     const user = validateToken(token);
     if (!user) {
@@ -798,15 +799,48 @@ function deleteDriveItem(itemId, token) {
     }
     
     const canEdit = user.role === 'Manager' || user.driveAccessLevel === 'editor';
-    if (!canEdit) {
-      throw new Error('Permission denied: You need Editor access to delete items');
-    }
+
+    const canDeleteTaskAttachmentFile = (file) => {
+      try {
+        if (!allowTaskAttachmentDelete) return false;
+        const rootFolder = getOrCreateTaskAttachmentsFolder();
+        const rootId = rootFolder.getId();
+
+        const parentIterator = file.getParents();
+        while (parentIterator.hasNext()) {
+          const parent = parentIterator.next();
+          if (parent.getId() === rootId) return true;
+
+          const grandParentIterator = parent.getParents();
+          while (grandParentIterator.hasNext()) {
+            const grandParent = grandParentIterator.next();
+            if (grandParent.getId() === rootId) return true;
+          }
+        }
+        return false;
+      } catch (err) {
+        Logger.log('Task attachment check failed: ' + err.message);
+        return false;
+      }
+    };
     
     // Try as file first, then as folder
+    let file = null;
     try {
-      const file = DriveApp.getFileById(itemId);
-      file.setTrashed(true);
+      file = DriveApp.getFileById(itemId);
     } catch (e) {
+      file = null;
+    }
+
+    if (file) {
+      if (!canEdit && !canDeleteTaskAttachmentFile(file)) {
+        throw new Error('Permission denied: You need Editor access to delete items');
+      }
+      file.setTrashed(true);
+    } else {
+      if (!canEdit) {
+        throw new Error('Permission denied: You need Editor access to delete folders');
+      }
       const folder = DriveApp.getFolderById(itemId);
       folder.setTrashed(true);
     }

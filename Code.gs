@@ -319,7 +319,7 @@ function validateToken(token) {
 function getAllUsers(token) {
   try {
     const user = validateToken(token);
-    if (!user || user.role !== 'Manager') throw new Error('Unauthorized');
+    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
 
     // Always fetch fresh data (no caching) since we're returning password data
     const users = supabaseSelect('users');
@@ -335,6 +335,8 @@ function getAllUsers(token) {
       allowedLookerReports: u.allowed_looker_reports || '',
       lastLogin: u.last_login,
       managerId: u.manager_id || null, // Manager for approval workflow
+      teamMembers: u.team_members || null,
+      department: u.department || null,
       driveAccessLevel: u.drive_access_level || 'viewer'
     }));
   } catch (error) {
@@ -345,7 +347,31 @@ function getAllUsers(token) {
 function saveUser(userData, token) {
   try {
     const currentUser = validateToken(token);
-    if (!currentUser || currentUser.role !== 'Manager') throw new Error('Unauthorized');
+    if (!currentUser || (currentUser.role !== 'Manager' && currentUser.role !== 'Super Manager')) throw new Error('Unauthorized');
+
+    const normalizeCsvList = function(value) {
+      return (value || '')
+        .split(',')
+        .map(function(item) { return item.trim(); })
+        .filter(function(item) { return item; });
+    };
+
+    const toCsvOrNull = function(list) {
+      return list.length ? list.join(',') : null;
+    };
+
+    const normalizeUniqueCaseInsensitive = function(list) {
+      const seen = {};
+      const out = [];
+      list.forEach(function(item) {
+        const key = item.toLowerCase();
+        if (!seen[key]) {
+          seen[key] = true;
+          out.push(item);
+        }
+      });
+      return out;
+    };
 
     const payload = {
       username: userData.username.trim(),
@@ -356,18 +382,117 @@ function saveUser(userData, token) {
       allowed_campaigns: (userData.allowedCampaigns === 'All' || userData.role === 'Manager') ? 'All' : (userData.allowedCampaigns || ''),
       allowed_looker_reports: userData.allowedLookerReports || '',
       drive_access_level: userData.driveAccessLevel || 'viewer',
-      manager_id: userData.managerId || null // Manager for approval workflow
+      manager_id: userData.managerId || null, // Manager for approval workflow
+      team_members: userData.teamMembers || null,
+      department: userData.department || null
     };
     
     if (userData.password) payload.password = userData.password.trim();
 
     const existing = supabaseRequest(`users?username=eq.${encodeURIComponent(payload.username)}`, 'GET');
-    
+
     if (existing && existing.length > 0) {
+      const oldUser = existing[0];
+      const oldManagers = normalizeUniqueCaseInsensitive(normalizeCsvList(oldUser.manager_id));
+      const newManagers = normalizeUniqueCaseInsensitive(normalizeCsvList(payload.manager_id));
+
+      const oldTeamMembers = normalizeUniqueCaseInsensitive(normalizeCsvList(oldUser.team_members));
+      const newTeamMembers = normalizeUniqueCaseInsensitive(normalizeCsvList(payload.team_members));
+
+      payload.manager_id = toCsvOrNull(newManagers);
+      payload.team_members = toCsvOrNull(newTeamMembers);
+    
       supabaseRequest(`users?username=eq.${encodeURIComponent(payload.username)}`, 'PATCH', payload);
+
+      // Sync manager relations: edited user's manager_id <-> each manager's team_members
+      oldManagers.forEach(function(managerUsername) {
+        if (newManagers.map(function(m) { return m.toLowerCase(); }).indexOf(managerUsername.toLowerCase()) === -1) {
+          const managerRows = supabaseRequest(`users?username=eq.${encodeURIComponent(managerUsername)}&select=team_members`, 'GET');
+          if (managerRows && managerRows.length > 0) {
+            const managerMembers = normalizeUniqueCaseInsensitive(normalizeCsvList(managerRows[0].team_members))
+              .filter(function(member) { return member.toLowerCase() !== payload.username.toLowerCase(); });
+            supabaseRequest(`users?username=eq.${encodeURIComponent(managerUsername)}`, 'PATCH', {
+              team_members: toCsvOrNull(managerMembers)
+            });
+          }
+        }
+      });
+
+      newManagers.forEach(function(managerUsername) {
+        const managerRows = supabaseRequest(`users?username=eq.${encodeURIComponent(managerUsername)}&select=team_members`, 'GET');
+        if (managerRows && managerRows.length > 0) {
+          const managerMembers = normalizeUniqueCaseInsensitive(normalizeCsvList(managerRows[0].team_members));
+          if (managerMembers.map(function(m) { return m.toLowerCase(); }).indexOf(payload.username.toLowerCase()) === -1) {
+            managerMembers.push(payload.username);
+            supabaseRequest(`users?username=eq.${encodeURIComponent(managerUsername)}`, 'PATCH', {
+              team_members: toCsvOrNull(managerMembers)
+            });
+          }
+        }
+      });
+
+      // Sync team_members relations: edited user's team_members <-> each member's manager_id
+      oldTeamMembers.forEach(function(memberUsername) {
+        if (newTeamMembers.map(function(m) { return m.toLowerCase(); }).indexOf(memberUsername.toLowerCase()) === -1) {
+          const memberRows = supabaseRequest(`users?username=eq.${encodeURIComponent(memberUsername)}&select=manager_id`, 'GET');
+          if (memberRows && memberRows.length > 0) {
+            const memberManagers = normalizeUniqueCaseInsensitive(normalizeCsvList(memberRows[0].manager_id))
+              .filter(function(managerName) { return managerName.toLowerCase() !== payload.username.toLowerCase(); });
+            supabaseRequest(`users?username=eq.${encodeURIComponent(memberUsername)}`, 'PATCH', {
+              manager_id: toCsvOrNull(memberManagers)
+            });
+          }
+        }
+      });
+
+      newTeamMembers.forEach(function(memberUsername) {
+        if (memberUsername.toLowerCase() === payload.username.toLowerCase()) return;
+        const memberRows = supabaseRequest(`users?username=eq.${encodeURIComponent(memberUsername)}&select=manager_id`, 'GET');
+        if (memberRows && memberRows.length > 0) {
+          const memberManagers = normalizeUniqueCaseInsensitive(normalizeCsvList(memberRows[0].manager_id));
+          if (memberManagers.map(function(m) { return m.toLowerCase(); }).indexOf(payload.username.toLowerCase()) === -1) {
+            memberManagers.push(payload.username);
+            supabaseRequest(`users?username=eq.${encodeURIComponent(memberUsername)}`, 'PATCH', {
+              manager_id: toCsvOrNull(memberManagers)
+            });
+          }
+        }
+      });
     } else {
       if (!payload.password) throw new Error('Password required for new user');
+      const newManagers = normalizeUniqueCaseInsensitive(normalizeCsvList(payload.manager_id));
+      const newTeamMembers = normalizeUniqueCaseInsensitive(normalizeCsvList(payload.team_members));
+      payload.manager_id = toCsvOrNull(newManagers);
+      payload.team_members = toCsvOrNull(newTeamMembers);
+
       supabaseRequest('users', 'POST', payload);
+
+      newManagers.forEach(function(managerUsername) {
+        const managerRows = supabaseRequest(`users?username=eq.${encodeURIComponent(managerUsername)}&select=team_members`, 'GET');
+        if (managerRows && managerRows.length > 0) {
+          const managerMembers = normalizeUniqueCaseInsensitive(normalizeCsvList(managerRows[0].team_members));
+          if (managerMembers.map(function(m) { return m.toLowerCase(); }).indexOf(payload.username.toLowerCase()) === -1) {
+            managerMembers.push(payload.username);
+            supabaseRequest(`users?username=eq.${encodeURIComponent(managerUsername)}`, 'PATCH', {
+              team_members: toCsvOrNull(managerMembers)
+            });
+          }
+        }
+      });
+
+      newTeamMembers.forEach(function(memberUsername) {
+        if (memberUsername.toLowerCase() === payload.username.toLowerCase()) return;
+        const memberRows = supabaseRequest(`users?username=eq.${encodeURIComponent(memberUsername)}&select=manager_id`, 'GET');
+        if (memberRows && memberRows.length > 0) {
+          const memberManagers = normalizeUniqueCaseInsensitive(normalizeCsvList(memberRows[0].manager_id));
+          if (memberManagers.map(function(m) { return m.toLowerCase(); }).indexOf(payload.username.toLowerCase()) === -1) {
+            memberManagers.push(payload.username);
+            supabaseRequest(`users?username=eq.${encodeURIComponent(memberUsername)}`, 'PATCH', {
+              manager_id: toCsvOrNull(memberManagers)
+            });
+          }
+        }
+      });
     }
 
     invalidateCache('users'); // Clear cache
