@@ -319,26 +319,40 @@ function validateToken(token) {
 function getAllUsers(token) {
   try {
     const user = validateToken(token);
-    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    if (!user) throw new Error('Unauthorized');
 
     // Always fetch fresh data (no caching) since we're returning password data
     const users = supabaseSelect('users');
+    const isManager = user.role === 'Manager' || user.role === 'Super Manager' || user.username === 'admin';
     
-    return users.map(u => ({
-      username: u.username,
-      role: u.role,
-      email: u.email,
-      password: u.password, // Include password for Manager to view/edit
-      allowedAccounts: u.allowed_accounts,
-      allowedDriveFolders: u.allowed_drive_folders,
-      allowedCampaigns: u.allowed_campaigns,
-      allowedLookerReports: u.allowed_looker_reports || '',
-      lastLogin: u.last_login,
-      managerId: u.manager_id || null, // Manager for approval workflow
-      teamMembers: u.team_members || null,
-      department: u.department || null,
-      driveAccessLevel: u.drive_access_level || 'viewer'
-    }));
+    return users.map(u => {
+      const baseData = {
+        username: u.username,
+        role: u.role,
+        department: u.department || null,
+        managerId: u.manager_id || null, // Include manager_id for all users (needed for manager dropdown filtering)
+        teamMembers: u.team_members || null, // Include team_members for all users (needed for manager dropdown filtering)
+        team_members: u.team_members || null, // Also include snake_case version for compatibility
+        manager_id: u.manager_id || null // Also include snake_case version for compatibility
+      };
+
+      // Only expose sensitive/management fields to Managers/Admins
+      if (isManager) {
+        return {
+          ...baseData,
+          email: u.email,
+          password: u.password, // Include password for Manager to view/edit
+          allowedAccounts: u.allowed_accounts,
+          allowedDriveFolders: u.allowed_drive_folders,
+          allowedCampaigns: u.allowed_campaigns,
+          allowedLookerReports: u.allowed_looker_reports || '',
+          lastLogin: u.last_login,
+          driveAccessLevel: u.drive_access_level || 'viewer'
+        };
+      }
+
+      return baseData;
+    });
   } catch (error) {
     throw new Error('Failed to load users: ' + error.message);
   }
@@ -638,8 +652,8 @@ function getAllAccountsForFrontend(token) {
     
     // Filter based on user access
     const filtered = allAccounts.filter(acc => {
-      // Managers see everything
-      if (user.role === 'Manager') {
+      // Managers / Super Managers / Admin see everything
+      if (user.role === 'Manager' || user.role === 'Super Manager' || user.username === 'admin') {
         return true;
       }
       
@@ -1244,19 +1258,52 @@ function isWorkflowEnabled(workflowName) {
 // LOOKER REPORTS MANAGEMENT
 // ============================================================================
 
+// Used by the Looker module in the UI. Normal users ONLY see reports explicitly
+// assigned to them via allowed_looker_reports (deny-by-default).
+function getLookerReports(token) {
+  try {
+    const user = validateToken(token);
+    if (!user) throw new Error('Unauthorized');
+
+    const reports = supabaseSelect('looker_reports') || [];
+
+    const isPrivileged = user.role === 'Manager' || user.role === 'Super Manager' || user.username === 'admin';
+    const allowed = user.allowedLookerReports || [];
+
+    // Managers/Admins see all active reports
+    const visibleReports = isPrivileged
+      ? reports.filter(r => r.active !== false)
+      : reports.filter(r => r.active !== false && allowed.includes(r.id));
+
+    return visibleReports.map(r => ({
+      id: r.id,
+      name: r.name,
+      url: r.url,
+      description: r.description || '',
+      allowedUsers: r.allowed_users || '',
+      active: r.active !== false
+    }));
+  } catch (error) {
+    Logger.log('Error in getLookerReports: ' + error.message);
+    return [];
+  }
+}
+
 function getAllLookerReports(token) {
   try {
     const user = validateToken(token);
     if (!user) throw new Error('Unauthorized');
 
+    // Management list for the User modal / admin pages: Managers/Super Managers/Admin only
+    if (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin') {
+      return [];
+    }
+
     // Fetch all Looker reports from database
     const reports = supabaseSelect('looker_reports');
     
-    // Filter for non-managers if needed (currently all users can see active reports)
-    let visibleReports = reports || [];
-    if (user.role !== 'Manager') {
-       visibleReports = visibleReports.filter(r => r.active !== false);
-    }
+     // Managers/Admins can view all reports (including inactive for management)
+     let visibleReports = reports || [];
     
     return visibleReports.map(r => ({
       id: r.id,
@@ -1660,6 +1707,34 @@ self.addEventListener('message', (event) => {
 
 function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+// ============================================================================
+// SUPABASE CONFIG (for frontend hybrid/direct mode)
+// ============================================================================
+
+/**
+ * Returns Supabase configuration from Script Properties.
+ * NOTE: If you are using direct Supabase calls from the browser, this key becomes
+ * visible to the client. Prefer using an anon key (not service role) for browser usage.
+ */
+function getSupabaseConfig(token) {
+  // Best-effort auth gate: allow if token is valid; otherwise still allow so login can proceed.
+  // (The HTML source already contains config in many deployments, so this is not a strict secret.)
+  try {
+    if (token) {
+      const user = validateToken(token);
+      if (!user) throw new Error('Unauthorized');
+    }
+  } catch (e) {
+    // If invalid token is provided, block.
+    throw e;
+  }
+
+  return {
+    url: SUPABASE_URL,
+    anonKey: SUPABASE_KEY
+  };
 }
 
 // ============================================================================
