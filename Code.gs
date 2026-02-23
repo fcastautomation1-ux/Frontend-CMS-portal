@@ -96,14 +96,66 @@ function isManager(token) {
 
 function hasAccountAccess(user, customerId) {
   if (!user || !customerId) return false;
-  if (user.role === 'Manager') return true;
+  
+      // Check module access for Manager and Super Manager
+      if (user.role === 'Manager' || user.role === 'Super Manager') {
+        // Check if module_access field exists in database
+        const moduleAccessStr = user.moduleAccess || user.module_access;
+        if (moduleAccessStr) {
+          try {
+            const moduleAccess = typeof moduleAccessStr === 'string' ? JSON.parse(moduleAccessStr) : moduleAccessStr;
+            // If module access object exists (even if empty), check Google Account module
+            if (moduleAccess.googleAccount && moduleAccess.googleAccount.enabled) {
+              if (moduleAccess.googleAccount.accessLevel === 'all') {
+                return true;
+              } else if (moduleAccess.googleAccount.accounts) {
+                return moduleAccess.googleAccount.accounts.includes(customerId.trim());
+              }
+              return false; // Module enabled but no access configured
+            }
+            // Module access is configured but Google Account module is NOT enabled - NO ACCESS
+            return false;
+          } catch (e) {
+            console.warn('Error parsing module access:', e);
+            return false; // On error, deny access
+          }
+        }
+        // NEW SYSTEM: No module access configured = NO ACCESS (removed backward compatibility)
+        return false;
+      }
+  
+  // Regular user access check
   if (user.allowedAccounts && user.allowedAccounts.includes('*')) return true;
   return user.allowedAccounts && user.allowedAccounts.includes(customerId.trim());
 }
 
 function hasCampaignAccess(user, campaignName) {
   if (!user || !campaignName) return false;
-  if (user.role === 'Manager') return true;
+  
+  // Check module access for Manager and Super Manager
+  if (user.role === 'Manager' || user.role === 'Super Manager') {
+    if (user.moduleAccess) {
+      try {
+        const moduleAccess = typeof user.moduleAccess === 'string' ? JSON.parse(user.moduleAccess) : user.moduleAccess;
+        if (moduleAccess.campaigns && moduleAccess.campaigns.enabled) {
+          if (moduleAccess.campaigns.accessLevel === 'all') {
+            return true;
+          }
+          // For specific campaigns, use the allowedCampaigns field
+          // (This is handled by the existing logic below)
+        } else {
+          // Module access configured but Campaigns module not enabled
+          return false;
+        }
+      } catch (e) {
+        console.warn('Error parsing module access:', e);
+      }
+    }
+    // No module access configured, default to full access (backward compatibility)
+    return true;
+  }
+  
+  // Regular user access check
   if (!user.allowedCampaigns || user.allowedCampaigns.length === 0) return true; // No campaign restrictions = full access
   if (user.allowedCampaigns.includes('*')) return true;
   return user.allowedCampaigns.includes(campaignName.trim());
@@ -189,7 +241,8 @@ function login(username, password) {
           driveAccessLevel: user.drive_access_level || 'viewer',
           allowedCampaigns: user.allowed_campaigns === 'All' ? ['*'] : (user.allowed_campaigns || '').split(',').map(c => c.trim()).filter(c => c),
           allowedLookerReports: user.allowed_looker_reports ? user.allowed_looker_reports.split(',').map(id => id.trim()).filter(id => id) : [],
-          avatarData: user.avatar_data || null
+          avatarData: user.avatar_data || null,
+          moduleAccess: user.module_access || null // Include module access configuration
         }
       };
     }
@@ -279,22 +332,27 @@ function validateToken(token) {
       return null;
     }
     
-    // ALWAYS fetch fresh user data from database (no caching)
-    const users = supabaseRequest(`users?username=eq.${encodeURIComponent(username)}&select=*`, 'GET');
+    // Fetch only the columns needed for auth – avatar_data is a large blob and must
+    // never be pulled on every request as it causes rapid egress quota exhaustion.
+    const USER_AUTH_COLS = 'username,role,department,allowed_accounts,allowed_drive_folders,drive_access_level,allowed_campaigns,email_notifications_enabled,module_access';
+    const users = supabaseRequest(`users?username=eq.${encodeURIComponent(username)}&select=${USER_AUTH_COLS}`, 'GET');
     
     if (users && users.length > 0) {
       const dbUser = users[0];
-      console.log('Token validated for:', dbUser.username, 'Avatar size:', dbUser.avatar_data ? dbUser.avatar_data.length : 0);
+      console.log('Token validated for:', dbUser.username);
       
       const userObj = {
         username: dbUser.username,
         role: dbUser.role,
+        department: dbUser.department || null,
         allowedAccounts: dbUser.allowed_accounts === 'All' ? ['*'] : (dbUser.allowed_accounts || '').split(',').map(id => id.trim()).filter(id => id),
         allowedDriveFolders: dbUser.allowed_drive_folders ? dbUser.allowed_drive_folders.split(',').map(id => id.trim()) : [],
         driveAccessLevel: dbUser.drive_access_level || 'viewer',
         allowedCampaigns: dbUser.allowed_campaigns === 'All' ? ['*'] : (dbUser.allowed_campaigns || '').split(',').map(c => c.trim()).filter(c => c),
-        avatarData: dbUser.avatar_data || null,
-        email_notifications_enabled: dbUser.email_notifications_enabled !== false // Default to true if not set
+        avatarData: null, // Not fetched here to avoid egress – avatar is returned at login only
+        email_notifications_enabled: dbUser.email_notifications_enabled !== false,
+        moduleAccess: dbUser.module_access || null,
+        module_access: dbUser.module_access || null
       };
       
       // Update Cache
@@ -321,11 +379,85 @@ function getAllUsers(token) {
     const user = validateToken(token);
     if (!user) throw new Error('Unauthorized');
 
-    // Always fetch fresh data (no caching) since we're returning password data
-    const users = supabaseSelect('users');
-    const isManager = user.role === 'Manager' || user.role === 'Super Manager' || user.username === 'admin';
+    // Always fetch fresh data (no caching) since we're returning password data.
+    // Explicitly select columns to avoid pulling avatar_data for every user (reduces egress).
+    const users = supabaseSelect('users', 'username,role,department,email,password,allowed_accounts,allowed_drive_folders,allowed_campaigns,allowed_looker_reports,last_login,drive_access_level,module_access,manager_id,team_members');
+    const isAdmin = user.username === 'admin' || user.role === 'Admin';
+    const isManager = user.role === 'Manager' || user.role === 'Super Manager' || isAdmin;
     
-    return users.map(u => {
+    // Check if caller has limited User module access (department-restricted)
+    let callerDepartments = []; // Array to support multiple departments
+    let hasLimitedUserAccess = false;
+    if (isAdmin || user.role === 'Super Manager') {
+      // Admin and Super Manager always see all users — no filtering
+      // They have unlimited access
+    } else if (isManager) {
+      // Check both moduleAccess and module_access (camelCase and snake_case)
+      const moduleAccessStr = user.moduleAccess || user.module_access;
+      if (moduleAccessStr) {
+        try {
+          const moduleAccess = typeof moduleAccessStr === 'string' 
+            ? JSON.parse(moduleAccessStr) 
+            : moduleAccessStr;
+          // If module access object exists (even if empty), check User module
+          if (moduleAccess.users && moduleAccess.users.enabled) {
+            // User module is enabled - check if it's department-restricted
+            if (moduleAccess.users.departmentRestricted !== false) {
+              hasLimitedUserAccess = true;
+              // Support multiple departments (comma-separated)
+              const deptStr = (user.department || '').trim();
+              if (deptStr) {
+                callerDepartments = deptStr.split(',').map(d => d.trim()).filter(d => d);
+              }
+            }
+            // else: departmentRestricted === false → sees all users (hasLimitedUserAccess stays false)
+          } else {
+            // Module access is configured but User module is NOT enabled → no access
+            hasLimitedUserAccess = true;
+            callerDepartments = [];
+          }
+        } catch (e) {
+          console.warn('Error parsing caller module access:', e);
+          // On parse error, deny access
+          hasLimitedUserAccess = true;
+          callerDepartments = [];
+        }
+      } else {
+        // NEW SYSTEM: null/undefined module_access = NO ACCESS (no backward compatibility)
+        hasLimitedUserAccess = true;
+        callerDepartments = [];
+      }
+    }
+    
+    return users
+      .filter(u => {
+        // Admin and Super Manager always see all users
+        if (isAdmin || user.role === 'Super Manager') {
+          return true;
+        }
+        
+        // If caller has limited User module access, filter by department
+        if (hasLimitedUserAccess) {
+          if (callerDepartments.length > 0) {
+            const userDept = (u.department || '').trim();
+            if (!userDept) {
+              return false; // User has no department, don't show
+            }
+            // Check if user's department is in Manager's department list
+            // Support both single department and comma-separated departments for users
+            const userDepts = userDept.split(',').map(d => d.trim().toLowerCase()).filter(d => d);
+            const callerDepts = callerDepartments.map(d => d.toLowerCase());
+            // Show user if any of their departments match any of Manager's departments
+            return userDepts.some(ud => callerDepts.includes(ud));
+          } else {
+            // User module not enabled - show no users
+            return false;
+          }
+        }
+        // No filtering needed
+        return true;
+      })
+      .map(u => {
       const baseData = {
         username: u.username,
         role: u.role,
@@ -347,7 +479,8 @@ function getAllUsers(token) {
           allowedCampaigns: u.allowed_campaigns,
           allowedLookerReports: u.allowed_looker_reports || '',
           lastLogin: u.last_login,
-          driveAccessLevel: u.drive_access_level || 'viewer'
+          driveAccessLevel: u.drive_access_level || 'viewer',
+          moduleAccess: u.module_access || null // Include module access configuration
         };
       }
 
@@ -362,6 +495,52 @@ function saveUser(userData, token) {
   try {
     const currentUser = validateToken(token);
     if (!currentUser || (currentUser.role !== 'Manager' && currentUser.role !== 'Super Manager')) throw new Error('Unauthorized');
+
+    // Check if user already exists (used for both new user and edit validations)
+    const checkExisting = supabaseRequest('users?username=eq.' + encodeURIComponent((userData.username || '').trim()), 'GET');
+    const isNewUser = !checkExisting || checkExisting.length === 0;
+    const oldUser = isNewUser ? null : checkExisting[0];
+    const oldRole = oldUser ? oldUser.role : null;
+    const newRole = userData.role || oldRole;
+    
+    // DEPARTMENT MANAGER: restrict new users to the Manager's own departments
+    if (currentUser.role === 'Manager') {
+      // Prevent creating Admin, Super Manager, or Manager users
+      // Managers can only create User and Supervisor roles
+      if (newRole === 'Admin' || newRole === 'Super Manager' || newRole === 'Manager') {
+        if (isNewUser) {
+          throw new Error('Department Managers are not permitted to create Admin, Super Manager, or Manager accounts. They can only create User and Supervisor roles.');
+        } else {
+          throw new Error('Department Managers are not permitted to change user roles to Admin, Super Manager, or Manager.');
+        }
+      }
+      
+      // Validate that selected departments are within Manager's allowed departments
+      const managerDepts = (currentUser.department || '').split(',').map(d => d.trim().toLowerCase()).filter(d => d);
+      if (managerDepts.length > 0 && userData.department) {
+        const userDepts = (userData.department || '').split(',').map(d => d.trim().toLowerCase()).filter(d => d);
+        // Check if all user departments are in Manager's departments
+        const invalidDepts = userDepts.filter(ud => !managerDepts.includes(ud));
+        if (invalidDepts.length > 0) {
+          throw new Error('You can only assign departments that you belong to. Invalid departments: ' + invalidDepts.join(', '));
+        }
+        // If valid, use the user's selected departments
+      } else if (isNewUser && managerDepts.length > 0) {
+        // For new users, if no department specified, use Manager's first department as default
+        if (!userData.department || userData.department.trim() === '') {
+          userData.department = currentUser.department.split(',')[0].trim();
+        }
+      }
+    }
+    
+    // ROLE UPGRADE RESTRICTION: Only Admin and Super Manager can upgrade Manager to Super Manager
+    if (!isNewUser && oldRole === 'Manager' && newRole === 'Super Manager') {
+      const isAdmin = currentUser.username === 'admin' || currentUser.role === 'Admin';
+      const isSuperManager = currentUser.role === 'Super Manager';
+      if (!isAdmin && !isSuperManager) {
+        throw new Error('Only Admin and Super Manager can upgrade a Manager to Super Manager.');
+      }
+    }
 
     const normalizeCsvList = function(value) {
       return (value || '')
@@ -387,18 +566,69 @@ function saveUser(userData, token) {
       return out;
     };
 
+    // Handle module access for Manager and Super Manager
+    let moduleAccessData = null;
+    if (userData.moduleAccess) {
+      try {
+        moduleAccessData = typeof userData.moduleAccess === 'string' ? JSON.parse(userData.moduleAccess) : userData.moduleAccess;
+      } catch (e) {
+        console.warn('Could not parse module access:', e);
+      }
+    }
+    
+    // AUTO-UPDATE: Only for User and Supervisor roles - never touch Manager, Super Manager, or Admin
+    // If user has role "User" and has team members, automatically change to "Supervisor"
+    // If user has role "Supervisor" and no team members, change back to "User"
+    let finalRole = userData.role || 'User';
+    
+    // Only apply auto-role update to User and Supervisor roles - preserve Manager, Super Manager, Admin
+    if (finalRole === 'User' || finalRole === 'Supervisor') {
+      const teamMembersList = (userData.teamMembers || '').split(',').map(function(m) { return m.trim(); }).filter(function(m) { return m; });
+      
+      if (finalRole === 'User' && teamMembersList.length > 0) {
+        finalRole = 'Supervisor';
+        console.log('Auto-updated role from User to Supervisor for user:', userData.username, 'because they have team members');
+      } else if (finalRole === 'Supervisor' && teamMembersList.length === 0) {
+        finalRole = 'User';
+        console.log('Auto-updated role from Supervisor to User for user:', userData.username, 'because they have no team members');
+      }
+    } else {
+      // For Manager, Super Manager, Admin - preserve the role exactly as set, no auto-update
+      console.log('Preserving role for user:', userData.username, 'Role:', finalRole);
+    }
+    
+    // Determine allowed_accounts based on module access ONLY (no default for Managers)
+    let finalAllowedAccounts = '';
+    if (moduleAccessData && moduleAccessData.googleAccount && moduleAccessData.googleAccount.enabled) {
+      if (moduleAccessData.googleAccount.accessLevel === 'all') {
+        finalAllowedAccounts = 'All';
+      } else if (moduleAccessData.googleAccount.accounts && moduleAccessData.googleAccount.accounts.length > 0) {
+        finalAllowedAccounts = moduleAccessData.googleAccount.accounts.join(',');
+      }
+      // If Google Account module is enabled but no accounts specified, leave empty (no access)
+    } else if (finalRole === 'Manager' || finalRole === 'Super Manager') {
+      // NEW SYSTEM: No Google Account module enabled = no accounts access (removed default "All")
+      finalAllowedAccounts = '';
+    } else {
+      // For other roles, use the provided allowedAccounts
+      finalAllowedAccounts = userData.allowedAccounts || '';
+    }
+
     const payload = {
       username: userData.username.trim(),
-      role: userData.role || 'User',
+      role: finalRole,
       email: userData.email ? userData.email.trim().toLowerCase() : '',
-      allowed_accounts: (userData.allowedAccounts === 'All' || userData.role === 'Manager') ? 'All' : userData.allowedAccounts,
+      allowed_accounts: finalAllowedAccounts,
       allowed_drive_folders: userData.allowedDriveFolders || '',
-      allowed_campaigns: (userData.allowedCampaigns === 'All' || userData.role === 'Manager') ? 'All' : (userData.allowedCampaigns || ''),
+      allowed_campaigns: (userData.username === 'admin' || finalRole === 'Admin') ? 'All' :
+        (finalRole === 'Manager' || finalRole === 'Super Manager') ? (finalAllowedAccounts === 'All' ? 'All' : '') :
+        (userData.allowedCampaigns || ''),
       allowed_looker_reports: userData.allowedLookerReports || '',
       drive_access_level: userData.driveAccessLevel || 'viewer',
       manager_id: userData.managerId || null, // Manager for approval workflow
       team_members: userData.teamMembers || null,
-      department: userData.department || null
+      department: userData.department || null,
+      module_access: (finalRole === 'Manager' || finalRole === 'Super Manager') ? (userData.moduleAccess || '{}') : null // Store module access as JSON string (empty object {} if no modules enabled, null for other roles)
     };
     
     if (userData.password) payload.password = userData.password.trim();
@@ -542,8 +772,8 @@ function updateUserDriveAccess(username, itemId, grantAccess, token, accessLevel
     const currentUser = validateToken(token);
     if (!currentUser || currentUser.role !== 'Manager') throw new Error('Unauthorized');
     
-    // Get current user data
-    const users = supabaseRequest(`users?username=eq.${encodeURIComponent(username)}&select=*`, 'GET');
+    // Only fetch the columns we actually need – avoids pulling avatar_data.
+    const users = supabaseRequest(`users?username=eq.${encodeURIComponent(username)}&select=email,allowed_drive_folders`, 'GET');
     if (!users || users.length === 0) throw new Error('User not found');
     
     const user = users[0];
@@ -652,12 +882,39 @@ function getAllAccountsForFrontend(token) {
     
     // Filter based on user access
     const filtered = allAccounts.filter(acc => {
-      // Managers / Super Managers / Admin see everything
-      if (user.role === 'Manager' || user.role === 'Super Manager' || user.username === 'admin') {
+      // Admin always sees everything
+      if (user.username === 'admin') {
         return true;
       }
       
-      // Check allowedAccounts
+      // Check module access for Manager and Super Manager
+      if (user.role === 'Manager' || user.role === 'Super Manager') {
+        // Check if module_access field exists in database
+        const moduleAccessStr = user.moduleAccess || user.module_access;
+        if (moduleAccessStr) {
+          try {
+            const moduleAccess = typeof moduleAccessStr === 'string' ? JSON.parse(moduleAccessStr) : moduleAccessStr;
+            // If module access object exists (even if empty), check Google Account module
+            if (moduleAccess.googleAccount && moduleAccess.googleAccount.enabled) {
+              if (moduleAccess.googleAccount.accessLevel === 'all') {
+                return true;
+              } else if (moduleAccess.googleAccount.accounts) {
+                return moduleAccess.googleAccount.accounts.includes(acc.customer_id);
+              }
+              return false; // Module enabled but no access configured
+            }
+            // Module access is configured but Google Account module is NOT enabled - NO ACCESS
+            return false;
+          } catch (e) {
+            console.warn('Error parsing module access:', e);
+            return false; // On error, deny access
+          }
+        }
+        // NEW SYSTEM: No module access configured = NO ACCESS (removed backward compatibility)
+        return false;
+      }
+      
+      // Regular user access check
       const allowedList = user.allowedAccounts || [];
       
       // If allowedAccounts contains '*', allow all
@@ -2263,7 +2520,14 @@ function addPackage(packageData, token) {
     
     const payload = {
       name: packageData.name.trim(),
+      app_name: (packageData.app_name || '').trim(),
       description: (packageData.description || '').trim(),
+      department: packageData.department || null,
+      playconsole_account: (packageData.playconsole_account || '').trim(),
+      marketer: (packageData.marketer || '').trim(),
+      product_owner: (packageData.product_owner || '').trim(),
+      monetization: (packageData.monetization || '').trim(),
+      admob: (packageData.admob || '').trim(),
       created_by: user.username
     };
     
@@ -2345,13 +2609,14 @@ function getMyPackages(token) {
     if (!user) throw new Error('Unauthorized');
     
     const assignments = supabaseRequest(
-      `user_packages?username=eq.${encodeURIComponent(user.username)}&select=package_id,packages(id,name)`,
+      `user_packages?username=eq.${encodeURIComponent(user.username)}&select=package_id,packages(id,name,department)`,
       'GET'
     );
     
     return (assignments || []).map(a => ({
       id: a.packages?.id || a.package_id,
-      name: a.packages?.name || 'Unknown'
+      name: a.packages?.name || 'Unknown',
+      department: a.packages?.department || null
     }));
   } catch (error) {
     throw new Error('Failed to get assigned packages: ' + error.message);

@@ -5,6 +5,7 @@
 const SUPABASE_URL = String(PropertiesService.getScriptProperties().getProperty('SUPABASE_URL') || '').trim().replace(/\/$/, "");
 const SUPABASE_KEY = String(PropertiesService.getScriptProperties().getProperty('SUPABASE_KEY') || '').trim();
 
+
 /**
  * Generic function to make requests to Supabase
  */
@@ -91,7 +92,8 @@ function supabaseExists(table, filters) {
     .map(([key, value]) => `${key}=eq.${encodeURIComponent(value)}`)
     .join('&');
   
-  const endpoint = `${table}?${filterParams}&select=*&limit=1`;
+  // Use select=id (minimal column) instead of select=* to avoid downloading large blobs.
+  const endpoint = `${table}?${filterParams}&select=id&limit=1`;
   const result = supabaseRequest(endpoint, 'GET');
   return result && result.length > 0;
 }
