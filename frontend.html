@@ -15115,6 +15115,13 @@
                 const token = authToken;
                 if (!token) return;
 
+                // Super Manager and Admin always see the team section regardless of count
+                const isPrivileged = currentUser && (
+                    currentUser.username === 'admin' ||
+                    currentUser.role === 'Admin' ||
+                    currentUser.role === 'Super Manager'
+                );
+
                 try {
                     const count = await directAPI.getTeamMembersCount(token);
                     const teamNavItem = document.querySelector('[data-section="team"]');
@@ -15122,8 +15129,8 @@
 
                     if (teamNavItem && teamCountBadge) {
                         teamCountBadge.textContent = count;
-                        // Only show if user has team members
-                        if (count > 0) {
+                        // Super Manager / Admin always see the team nav item
+                        if (isPrivileged || count > 0) {
                             teamNavItem.style.display = 'flex';
                         } else {
                             teamNavItem.style.display = 'none';
@@ -15132,7 +15139,8 @@
                 } catch (error) {
                     console.error('Error loading team members count:', error);
                     const teamNavItem = document.querySelector('[data-section="team"]');
-                    if (teamNavItem) teamNavItem.style.display = 'none';
+                    // Super Manager / Admin keep the team nav visible even on error
+                    if (teamNavItem && !isPrivileged) teamNavItem.style.display = 'none';
                 }
             }
 
@@ -15212,29 +15220,40 @@
 
                     const meLower = (currentUser.username || '').toLowerCase();
 
-                    // Explicit team members (from my own team_members column)
-                    const myRow = (allUsersData || []).find(u => (u.username || '').toLowerCase() === meLower);
-                    const explicitMembers = new Set(
-                        ((myRow?.team_members || '').toString())
-                            .split(',')
-                            .map(s => s.trim())
-                            .filter(Boolean)
-                            .map(s => s.toLowerCase())
-                    );
+                    // Super Manager and Admin see all users automatically
+                    const isPrivilegedUser = currentUser.username === 'admin' ||
+                        currentUser.role === 'Admin' ||
+                        currentUser.role === 'Super Manager';
 
-                    // Reverse lookup team members (users whose manager_id contains me)
-                    const reverseTeamMembers = new Set();
-                    (allUsersData || []).forEach(u => {
-                        if (!u.manager_id) return;
-                        const managers = u.manager_id.split(',').map(m => m.trim().toLowerCase()).filter(Boolean);
-                        if (managers.includes(meLower)) reverseTeamMembers.add((u.username || '').toLowerCase());
-                    });
+                    let teamMembers;
+                    if (isPrivilegedUser) {
+                        // All users except self are shown as team members
+                        teamMembers = (allUsersData || []).filter(u => (u.username || '').toLowerCase() !== meLower);
+                    } else {
+                        // Explicit team members (from my own team_members column)
+                        const myRow = (allUsersData || []).find(u => (u.username || '').toLowerCase() === meLower);
+                        const explicitMembers = new Set(
+                            ((myRow?.team_members || '').toString())
+                                .split(',')
+                                .map(s => s.trim())
+                                .filter(Boolean)
+                                .map(s => s.toLowerCase())
+                        );
 
-                    // Union
-                    const teamSet = new Set([...explicitMembers, ...reverseTeamMembers]);
-                    teamSet.delete(meLower);
+                        // Reverse lookup team members (users whose manager_id contains me)
+                        const reverseTeamMembers = new Set();
+                        (allUsersData || []).forEach(u => {
+                            if (!u.manager_id) return;
+                            const managers = u.manager_id.split(',').map(m => m.trim().toLowerCase()).filter(Boolean);
+                            if (managers.includes(meLower)) reverseTeamMembers.add((u.username || '').toLowerCase());
+                        });
 
-                    const teamMembers = (allUsersData || []).filter(u => teamSet.has((u.username || '').toLowerCase()));
+                        // Union
+                        const teamSet = new Set([...explicitMembers, ...reverseTeamMembers]);
+                        teamSet.delete(meLower);
+
+                        teamMembers = (allUsersData || []).filter(u => teamSet.has((u.username || '').toLowerCase()));
+                    }
 
                     const selectedDepartment = document.getElementById('teamFilterDepartment')?.value || 'all';
                     const selectedDate = document.getElementById('teamFilterDate')?.value || 'all';
