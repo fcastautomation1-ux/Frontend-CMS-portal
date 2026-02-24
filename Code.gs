@@ -494,7 +494,8 @@ function getAllUsers(token) {
 function saveUser(userData, token) {
   try {
     const currentUser = validateToken(token);
-    if (!currentUser || (currentUser.role !== 'Manager' && currentUser.role !== 'Super Manager')) throw new Error('Unauthorized');
+    const isAdmin = currentUser && (currentUser.username === 'admin' || currentUser.role === 'Admin');
+    if (!currentUser || (!isAdmin && currentUser.role !== 'Manager' && currentUser.role !== 'Super Manager')) throw new Error('Unauthorized');
 
     // Check if user already exists (used for both new user and edit validations)
     const checkExisting = supabaseRequest('users?username=eq.' + encodeURIComponent((userData.username || '').trim()), 'GET');
@@ -749,7 +750,8 @@ function saveUser(userData, token) {
 function deleteUser(username, token) {
   try {
     const currentUser = validateToken(token);
-    if (!currentUser || currentUser.role !== 'Manager') throw new Error('Unauthorized');
+    const isAdmin = currentUser && (currentUser.username === 'admin' || currentUser.role === 'Admin');
+    if (!currentUser || (!isAdmin && currentUser.role !== 'Manager' && currentUser.role !== 'Super Manager')) throw new Error('Unauthorized');
     if (username === 'admin') throw new Error('Cannot delete admin');
 
     supabaseRequest(`users?username=eq.${encodeURIComponent(username)}`, 'DELETE');
@@ -770,7 +772,8 @@ function deleteUser(username, token) {
 function updateUserDriveAccess(username, itemId, grantAccess, token, accessLevel = 'viewer') {
   try {
     const currentUser = validateToken(token);
-    if (!currentUser || currentUser.role !== 'Manager') throw new Error('Unauthorized');
+    const isAdmin = currentUser && (currentUser.username === 'admin' || currentUser.role === 'Admin');
+    if (!currentUser || (!isAdmin && currentUser.role !== 'Manager' && currentUser.role !== 'Super Manager')) throw new Error('Unauthorized');
     
     // Only fetch the columns we actually need – avoids pulling avatar_data.
     const users = supabaseRequest(`users?username=eq.${encodeURIComponent(username)}&select=email,allowed_drive_folders`, 'GET');
@@ -1549,10 +1552,11 @@ function getLookerReports(token) {
 function getAllLookerReports(token) {
   try {
     const user = validateToken(token);
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
     if (!user) throw new Error('Unauthorized');
 
     // Management list for the User modal / admin pages: Managers/Super Managers/Admin only
-    if (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin') {
+    if (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager') {
       return [];
     }
 
@@ -1579,7 +1583,8 @@ function getAllLookerReports(token) {
 function saveLookerReport(reportData, token) {
   try {
     const user = validateToken(token);
-    if (!user || user.role !== 'Manager') throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
 
     // Clean up URL if it's an iframe code
     let url = reportData.url;
@@ -1614,7 +1619,8 @@ function saveLookerReport(reportData, token) {
 function deleteLookerReport(id, token) {
   try {
     const user = validateToken(token);
-    if (!user || user.role !== 'Manager') throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
 
     supabaseRequest(`looker_reports?id=eq.${id}`, 'DELETE');
     return true;
@@ -2501,7 +2507,8 @@ function removeAutomaticReminderTrigger() {
 function getPackages(token) {
   try {
     const user = validateToken(token);
-    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
     
     const packages = supabaseRequest('packages?select=*&order=name.asc', 'GET');
     return packages || [];
@@ -2516,7 +2523,8 @@ function getPackages(token) {
 function addPackage(packageData, token) {
   try {
     const user = validateToken(token);
-    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
     
     const payload = {
       name: packageData.name.trim(),
@@ -2541,12 +2549,43 @@ function addPackage(packageData, token) {
 }
 
 /**
+ * Update an existing package (Manager only)
+ */
+function updatePackage(packageData, token) {
+  try {
+    const user = validateToken(token);
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    
+    if (!packageData.id) throw new Error('Package ID is required');
+    
+    const payload = {
+      name: packageData.name.trim(),
+      app_name: (packageData.app_name || '').trim(),
+      description: (packageData.description || '').trim(),
+      department: packageData.department || null,
+      playconsole_account: (packageData.playconsole_account || '').trim(),
+      marketer: (packageData.marketer || '').trim(),
+      product_owner: (packageData.product_owner || '').trim(),
+      monetization: (packageData.monetization || '').trim(),
+      admob: (packageData.admob || '').trim()
+    };
+    
+    const result = supabaseRequest(`packages?id=eq.${encodeURIComponent(packageData.id)}`, 'PATCH', payload);
+    return result;
+  } catch (error) {
+    throw new Error('Failed to update package: ' + error.message);
+  }
+}
+
+/**
  * Delete a package (Manager only)
  */
 function deletePackage(packageId, token) {
   try {
     const user = validateToken(token);
-    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
     
     supabaseRequest(`packages?id=eq.${encodeURIComponent(packageId)}`, 'DELETE');
     return true;
@@ -2561,7 +2600,8 @@ function deletePackage(packageId, token) {
 function getUserPackages(token) {
   try {
     const user = validateToken(token);
-    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
     
     const assignments = supabaseRequest('user_packages?select=*,packages(name)&order=username.asc', 'GET');
     return assignments || [];
@@ -2578,7 +2618,8 @@ function getUserPackages(token) {
 function assignPackagesToUser(username, packageIds, token) {
   try {
     const user = validateToken(token);
-    if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+    const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+    if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
     
     // First, remove all existing assignments for this user
     supabaseRequest(`user_packages?username=eq.${encodeURIComponent(username)}`, 'DELETE');

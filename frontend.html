@@ -954,7 +954,8 @@
             },
             async saveDepartment(departmentData, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
 
                 const payload = {
                     name: departmentData.name.trim(),
@@ -970,7 +971,8 @@
             },
             async deleteDepartment(departmentId, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 await directDB.delete('departments', { id: departmentId });
                 return true;
             },
@@ -1140,7 +1142,8 @@
             },
             async saveUser(userData, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
 
                 // VALIDATION: Email is mandatory
                 if (!userData.email || userData.email.trim() === '') {
@@ -1490,13 +1493,15 @@
             },
             async deleteUser(username, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 if (username === 'admin') throw new Error('Cannot delete admin');
                 await directDB.delete('users', { username }); return true;
             },
             async updateUserDriveAccess(username, itemId, grantAccess, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 const users = await directDB.select('users', { username });
                 if (!users?.length) throw new Error('User not found');
                 const targetUser = users[0];
@@ -1883,7 +1888,8 @@
             },
             async saveLookerReport(reportData, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin')) throw new Error('Unauthorized - Managers only');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized - Managers only');
 
                 const payload = {
                     id: reportData.id || crypto.randomUUID(),
@@ -1904,7 +1910,8 @@
             },
             async deleteLookerReport(reportId, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager' && user.username !== 'admin')) throw new Error('Unauthorized - Managers only');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized - Managers only');
 
                 await directDB.delete('looker_reports', { id: reportId });
                 return true;
@@ -4158,7 +4165,8 @@
             // ================================================================
             async getPackages(token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 const client = getSupabase();
                 const { data, error } = await client.from('packages').select('*').order('name', { ascending: true });
                 if (error) throw new Error(error.message);
@@ -4166,7 +4174,8 @@
             },
             async addPackage(packageData, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 if (!packageData.name || !packageData.name.trim()) throw new Error('Package name is required');
                 const client = getSupabase();
                 const { data, error } = await client.from('packages').insert({
@@ -4186,7 +4195,8 @@
             },
             async addPackagesBulk(packageNames, department, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
 
                 if (!Array.isArray(packageNames) || packageNames.length === 0) {
                     throw new Error('No package names provided');
@@ -4233,7 +4243,8 @@
             },
             async updatePackage(packageData, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 if (!packageData?.id) throw new Error('Package ID is required');
                 if (!packageData?.name || !packageData.name.trim()) throw new Error('App name is required');
 
@@ -4257,7 +4268,8 @@
             },
             async deletePackage(packageId, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 const client = getSupabase();
                 const { error } = await client.from('packages').delete().eq('id', packageId);
                 if (error) throw new Error(error.message);
@@ -4265,7 +4277,8 @@
             },
             async getUserPackages(token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 const client = getSupabase();
                 const { data, error } = await client.from('user_packages').select('*, packages(name)').order('username', { ascending: true });
                 if (error) throw new Error(error.message);
@@ -4273,7 +4286,8 @@
             },
             async assignPackagesToUser(username, packageIds, token) {
                 const user = await this.validateToken(token);
-                if (!user || (user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
+                const isAdmin = user && (user.username === 'admin' || user.role === 'Admin');
+                if (!user || (!isAdmin && user.role !== 'Manager' && user.role !== 'Super Manager')) throw new Error('Unauthorized');
                 const client = getSupabase();
                 // Remove existing assignments
                 await client.from('user_packages').delete().eq('username', username);
@@ -12763,11 +12777,11 @@
                     }
                 } else if (sectionName === 'packages') {
                     // PACKAGES TAB: Load packages (Manager/Admin only)
-                    if (currentUser && (currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin')) {
+                    if (currentUser && (currentUser.role === 'Admin' || currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin')) {
                         loadPackages();
                         loadPackageAssignUsers();
                     } else {
-                        document.getElementById('packagesTableBody').innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 40px; color: #F43F5E;">Access denied. Only Managers can manage packages.</td></tr>';
+                        document.getElementById('packagesTableBody').innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 40px; color: #F43F5E;">Access denied. Only Managers can manage packages.</td></tr>';
                     }
                 }
             }
@@ -15115,6 +15129,13 @@
                 const token = authToken;
                 if (!token) return;
 
+                // Super Manager and Admin always see the team section regardless of count
+                const isPrivileged = currentUser && (
+                    currentUser.username === 'admin' ||
+                    currentUser.role === 'Admin' ||
+                    currentUser.role === 'Super Manager'
+                );
+
                 try {
                     const count = await directAPI.getTeamMembersCount(token);
                     const teamNavItem = document.querySelector('[data-section="team"]');
@@ -15122,8 +15143,8 @@
 
                     if (teamNavItem && teamCountBadge) {
                         teamCountBadge.textContent = count;
-                        // Only show if user has team members
-                        if (count > 0) {
+                        // Super Manager / Admin always see the team nav item
+                        if (isPrivileged || count > 0) {
                             teamNavItem.style.display = 'flex';
                         } else {
                             teamNavItem.style.display = 'none';
@@ -15132,7 +15153,8 @@
                 } catch (error) {
                     console.error('Error loading team members count:', error);
                     const teamNavItem = document.querySelector('[data-section="team"]');
-                    if (teamNavItem) teamNavItem.style.display = 'none';
+                    // Super Manager / Admin keep the team nav visible even on error
+                    if (teamNavItem && !isPrivileged) teamNavItem.style.display = 'none';
                 }
             }
 
@@ -15212,29 +15234,40 @@
 
                     const meLower = (currentUser.username || '').toLowerCase();
 
-                    // Explicit team members (from my own team_members column)
-                    const myRow = (allUsersData || []).find(u => (u.username || '').toLowerCase() === meLower);
-                    const explicitMembers = new Set(
-                        ((myRow?.team_members || '').toString())
-                            .split(',')
-                            .map(s => s.trim())
-                            .filter(Boolean)
-                            .map(s => s.toLowerCase())
-                    );
+                    // Super Manager and Admin see all users automatically
+                    const isPrivilegedUser = currentUser.username === 'admin' ||
+                        currentUser.role === 'Admin' ||
+                        currentUser.role === 'Super Manager';
 
-                    // Reverse lookup team members (users whose manager_id contains me)
-                    const reverseTeamMembers = new Set();
-                    (allUsersData || []).forEach(u => {
-                        if (!u.manager_id) return;
-                        const managers = u.manager_id.split(',').map(m => m.trim().toLowerCase()).filter(Boolean);
-                        if (managers.includes(meLower)) reverseTeamMembers.add((u.username || '').toLowerCase());
-                    });
+                    let teamMembers;
+                    if (isPrivilegedUser) {
+                        // All users except self are shown as team members
+                        teamMembers = (allUsersData || []).filter(u => (u.username || '').toLowerCase() !== meLower);
+                    } else {
+                        // Explicit team members (from my own team_members column)
+                        const myRow = (allUsersData || []).find(u => (u.username || '').toLowerCase() === meLower);
+                        const explicitMembers = new Set(
+                            ((myRow?.team_members || '').toString())
+                                .split(',')
+                                .map(s => s.trim())
+                                .filter(Boolean)
+                                .map(s => s.toLowerCase())
+                        );
 
-                    // Union
-                    const teamSet = new Set([...explicitMembers, ...reverseTeamMembers]);
-                    teamSet.delete(meLower);
+                        // Reverse lookup team members (users whose manager_id contains me)
+                        const reverseTeamMembers = new Set();
+                        (allUsersData || []).forEach(u => {
+                            if (!u.manager_id) return;
+                            const managers = u.manager_id.split(',').map(m => m.trim().toLowerCase()).filter(Boolean);
+                            if (managers.includes(meLower)) reverseTeamMembers.add((u.username || '').toLowerCase());
+                        });
 
-                    const teamMembers = (allUsersData || []).filter(u => teamSet.has((u.username || '').toLowerCase()));
+                        // Union
+                        const teamSet = new Set([...explicitMembers, ...reverseTeamMembers]);
+                        teamSet.delete(meLower);
+
+                        teamMembers = (allUsersData || []).filter(u => teamSet.has((u.username || '').toLowerCase()));
+                    }
 
                     const selectedDepartment = document.getElementById('teamFilterDepartment')?.value || 'all';
                     const selectedDate = document.getElementById('teamFilterDate')?.value || 'all';
@@ -28852,7 +28885,7 @@
             function loadPackages() {
                 const tbody = document.getElementById('packagesTableBody');
                 if (!tbody) return;
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 40px;"><div class="loading-spinner"></div> Loading packages...</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 40px;"><div class="loading-spinner"></div> Loading packages...</td></tr>';
 
                 google.script.run
                     .withSuccessHandler(function (packages) {
@@ -28894,7 +28927,7 @@
                             .getUserPackages(authToken);
                     })
                     .withFailureHandler(function (error) {
-                        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 40px; color: #F43F5E;">Failed to load packages: ' + (error?.message || error) + '</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 40px; color: #F43F5E;">Failed to load packages: ' + (error?.message || error) + '</td></tr>';
                     })
                     .getPackages(authToken);
             }
