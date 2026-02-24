@@ -49,11 +49,11 @@
         // ================================================================
         // CONFIGURATION
         // ================================================================
-        // ⚠️  Use your project's ANON key here (Supabase Dashboard → Project Settings → API → anon/public).
-        // NEVER put the service_role key in browser-side code.
+        // NOTE: This is a fallback config. The app will try to sync the live
+        // config from Apps Script Script Properties after login.
         let SUPABASE_CONFIG = {
             url: 'https://nxvfotgayhxxmparvois.supabase.co',
-            anonKey: 'YOUR_ANON_KEY_HERE'
+            anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im54dmZvdGdheWh4eG1wYXJ2b2lzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzMxNTUxMywiZXhwIjoyMDgyODkxNTEzfQ.pLc__SJjS28wLSWOPn4AfQe8W3JTU9kA4uEtZv5xvlY'
         };
 
         // Legacy flag (not currently used elsewhere, but kept for compatibility)
@@ -117,19 +117,13 @@
         const USER_AUTH_COLUMNS = 'username,role,department,allowed_accounts,allowed_drive_folders,allowed_campaigns,allowed_looker_reports,drive_access_level,module_access,email_notifications_enabled';
         // Columns for user-management lists – excludes avatar_data (avatars are heavy blobs).
         const USER_LIST_COLUMNS = 'username,role,department,email,password,allowed_accounts,allowed_drive_folders,allowed_campaigns,allowed_looker_reports,last_login,drive_access_level,module_access,manager_id,team_members';
-        // Login columns: same as auth columns + password, email, and avatar_data (avatar fetched ONCE at login only).
-        const LOGIN_COLUMNS = USER_AUTH_COLUMNS + ',password,email,avatar_data';
 
         const directDB = {
-            // options: { limit, offset, orderBy, orderAsc }
-            async select(table, filters = {}, columns = '*', options = {}) {
+            async select(table, filters = {}, columns = '*') {
                 const client = getSupabase();
                 if (!client) throw new Error('Supabase not configured');
                 let query = client.from(table).select(columns);
                 for (const [k, v] of Object.entries(filters)) query = query.eq(k, v);
-                if (options.orderBy) query = query.order(options.orderBy, { ascending: options.orderAsc !== false });
-                if (options.limit != null) query = query.limit(options.limit);
-                if (options.offset != null) query = query.range(options.offset, options.offset + (options.limit || 1000) - 1);
                 const { data, error } = await query;
                 if (error) throw new Error(error.message);
                 return data;
@@ -734,9 +728,7 @@
                         console.error('Supabase client not initialized');
                         return { success: false, error: 'Database connection not available. Please refresh the page.' };
                     }
-                    // Use LOGIN_COLUMNS to fetch only what is needed (avoids select=*).
-                    // avatar_data is fetched here ONCE and cached; validateToken never re-fetches it.
-                    const users = await directDB.select('users', { username }, LOGIN_COLUMNS);
+                    const users = await directDB.select('users', { username });
                     if (!users?.length || users[0].password !== password)
                         return { success: false, error: 'Invalid username or password' };
                     const u = users[0];
@@ -1287,17 +1279,6 @@
                         // Find managers that were removed
                         const managersRemoved = oldManagersList.filter(m => !newManagersList.map(n => n.toLowerCase()).includes(m.toLowerCase()));
 
-                        // BATCH-FETCH all affected managers in a single query to avoid N+1 SELECT calls.
-                        const _allAffectedMgrs = [...new Set([...managersAdded, ...managersRemoved])];
-                        const _affMgrsMap = {};
-                        if (_allAffectedMgrs.length > 0) {
-                            const { data: _affMgrRows } = await getSupabase()
-                                .from('users')
-                                .select('username,team_members')
-                                .in('username', _allAffectedMgrs);
-                            (_affMgrRows || []).forEach(m => { _affMgrsMap[m.username] = m; });
-                        }
-
                         // Notify and sync for each newly added manager
                         for (const newManager of managersAdded) {
                             // Notify Manager
@@ -1317,8 +1298,12 @@
                                 createdBy: user.username
                             });
 
-                            // SYNC: Update new manager's team_members using batched data (no extra SELECT)
-                            const newManagerData = _affMgrsMap[newManager];
+                            // SYNC: Update new manager's team_members to include this user
+                            const { data: newManagerData } = await getSupabase()
+                                .from('users')
+                                .select('team_members')
+                                .eq('username', newManager)
+                                .single();
                             if (newManagerData) {
                                 const currentMembers = (newManagerData.team_members || '').split(',').map(u => u.trim()).filter(u => u);
                                 if (!currentMembers.map(c => c.toLowerCase()).includes(payload.username.toLowerCase())) {
@@ -1331,7 +1316,11 @@
 
                         // SYNC: For each removed manager, remove user from their team_members
                         for (const oldManager of managersRemoved) {
-                            const oldManagerData = _affMgrsMap[oldManager];
+                            const { data: oldManagerData } = await getSupabase()
+                                .from('users')
+                                .select('team_members')
+                                .eq('username', oldManager)
+                                .single();
                             if (oldManagerData && oldManagerData.team_members) {
                                 const oldMembers = oldManagerData.team_members.split(',').map(u => u.trim()).filter(u => u);
                                 const updatedMembers = oldMembers.filter(m => m.toLowerCase() !== payload.username.toLowerCase());
@@ -1370,16 +1359,6 @@
                             // Handle multiple managers (comma-separated)
                             const managersList = payload.manager_id.split(',').map(m => m.trim()).filter(m => m);
 
-                            // BATCH-FETCH all managers at once to avoid N+1 SELECT queries
-                            const _newUserMgrsMap = {};
-                            if (managersList.length > 0) {
-                                const { data: _newUserMgrRows } = await getSupabase()
-                                    .from('users')
-                                    .select('username,team_members')
-                                    .in('username', managersList);
-                                (_newUserMgrRows || []).forEach(m => { _newUserMgrsMap[m.username] = m; });
-                            }
-
                             for (const managerId of managersList) {
                                 // Notify Manager
                                 await this.createNotification({
@@ -1398,8 +1377,12 @@
                                     createdBy: user.username
                                 });
 
-                                // SYNC: Update manager's team_members using batched data (no extra SELECT)
-                                const managerData = _newUserMgrsMap[managerId];
+                                // SYNC: Update manager's team_members to include this new user
+                                const { data: managerData } = await getSupabase()
+                                    .from('users')
+                                    .select('team_members')
+                                    .eq('username', managerId)
+                                    .single();
                                 if (managerData) {
                                     const currentMembers = (managerData.team_members || '').split(',').map(u => u.trim()).filter(u => u);
                                     if (!currentMembers.map(c => c.toLowerCase()).includes(payload.username.toLowerCase())) {
@@ -14043,78 +14026,50 @@
                 }
             }
 
-            // Notifications: use Supabase Realtime for instant delivery.
-            // Falls back to lightweight 30-second polling if realtime is unavailable.
+            // Auto-refresh notifications every 5 seconds for real-time feel
             async function startNotificationAutoRefresh() {
                 if (notificationRefreshInterval) {
                     clearInterval(notificationRefreshInterval);
-                    notificationRefreshInterval = null;
                 }
 
-                if (!authToken || !currentUser) return;
+                // Initial load and setup
+                if (authToken && currentUser) {
+                    // Load initial notification count and IDs (silently, no animations)
+                    try {
+                        const count = await directAPI.getUnreadNotificationCount(authToken);
+                        lastNotificationCount = count; // Set baseline
 
-                // Initial load — set baseline counts/IDs
-                try {
-                    const count = await directAPI.getUnreadNotificationCount(authToken);
-                    lastNotificationCount = count;
-                    const notifications = await directAPI.getNotifications(authToken);
-                    lastNotificationIds = new Set(notifications.map(n => n.id));
-                    const badge = document.getElementById('notificationBadge');
-                    if (badge) {
-                        if (count > 0) { badge.textContent = count > 99 ? '99+' : count; badge.style.display = 'flex'; }
-                        else { badge.style.display = 'none'; }
+                        const notifications = await directAPI.getNotifications(authToken);
+                        lastNotificationIds = new Set(notifications.map(n => n.id));
+
+                        // Update UI without animations
+                        const badge = document.getElementById('notificationBadge');
+                        if (badge) {
+                            if (count > 0) {
+                                badge.textContent = count > 99 ? '99+' : count;
+                                badge.style.display = 'flex';
+                            } else {
+                                badge.style.display = 'none';
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error initializing notifications:', error);
                     }
-                } catch (error) {
-                    console.error('Error initializing notifications:', error);
-                }
 
-                initializeBrowserNotifications();
+                    // Initialize browser notifications
+                    initializeBrowserNotifications();
 
-                // Subscribe to this user's notifications via Realtime
-                const client = getSupabase();
-                if (client && currentUser?.username) {
-                    const notifChannel = client.channel(`rt-notifs-${currentUser.username}`)
-                        .on('postgres_changes',
-                            { event: 'INSERT', schema: 'public', table: 'notifications',
-                              filter: `user_id=eq.${currentUser.username}` },
-                            () => {
-                                updateNotificationCount();
-                                const dd = document.getElementById('notificationDropdown');
-                                if (dd && dd.style.display === 'block') loadNotifications();
-                            }
-                        )
-                        .on('postgres_changes',
-                            { event: 'UPDATE', schema: 'public', table: 'notifications',
-                              filter: `user_id=eq.${currentUser.username}` },
-                            () => { updateNotificationCount(); }
-                        )
-                        .subscribe((status) => {
-                            if (status === 'SUBSCRIBED') {
-                                console.log('✅ Realtime: notifications');
-                            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-                                // Fallback: 30-second poll (much lighter than the old 5s interval)
-                                if (!notificationRefreshInterval) {
-                                    console.warn('⚠️ Notification realtime failed, falling back to 30s polling');
-                                    notificationRefreshInterval = setInterval(() => {
-                                        if (authToken && currentUser) {
-                                            updateNotificationCount();
-                                            const dd = document.getElementById('notificationDropdown');
-                                            if (dd && dd.style.display === 'block') loadNotifications();
-                                        }
-                                    }, 30000);
-                                }
-                            }
-                        });
-                    realtimeChannels.push(notifChannel);
-                } else {
-                    // No Supabase client — use 30s fallback poll
+                    // Now start the interval for real-time updates
                     notificationRefreshInterval = setInterval(() => {
                         if (authToken && currentUser) {
                             updateNotificationCount();
-                            const dd = document.getElementById('notificationDropdown');
-                            if (dd && dd.style.display === 'block') loadNotifications();
+                            // Reload notifications if dropdown is open
+                            const dropdown = document.getElementById('notificationDropdown');
+                            if (dropdown && dropdown.style.display === 'block') {
+                                loadNotifications();
+                            }
                         }
-                    }, 30000);
+                    }, 5000); // Check every 5 seconds for real-time updates
                 }
             }
 
@@ -14137,136 +14092,104 @@
             }
 
             // ============================================================================
+            // AUTO-REFRESH FOR ALL SECTIONS - Real-time updates from live database
+            // Refreshes ALL section data in background so data is always ready
             // ============================================================================
-            // REALTIME SUBSCRIPTIONS - Portal updates ONLY when DB actually changes.
-            // No more fixed-interval polling that wastes egress quota.
-            // Requires: Supabase Dashboard → Database → Replication → enable realtime
-            //           for tables: todos, accounts, users, departments, notifications.
-            // ============================================================================
-            let realtimeChannels = [];  // active Supabase channels
-            let globalRefreshIntervals = {}; // fallback timers (used only if realtime fails)
-
-            // Debounce helper: prevents rapid-fire reloads when many rows change at once
-            const _rtDebouncers = {};
-            function _rtDebounce(key, fn, delay = 400) {
-                clearTimeout(_rtDebouncers[key]);
-                _rtDebouncers[key] = setTimeout(() => { if (authToken) fn(); }, delay);
-            }
+            let globalRefreshIntervals = {};
 
             function startSectionAutoRefresh() {
+                // Clear any existing intervals
                 stopSectionAutoRefresh();
+
                 if (!authToken) return;
 
-                const client = getSupabase();
-                if (!client) {
-                    console.warn('Supabase not ready — realtime unavailable, falling back to polling');
-                    _startFallbackPolling();
-                    return;
-                }
+                // --- ACCOUNTS: Refresh every 8 seconds ---
+                globalRefreshIntervals.accounts = setInterval(() => {
+                    if (!authToken) return;
+                    loadAccounts(true, true); // Force refresh, silent mode
+                }, 8000);
 
-                // --- TODOS: most time-sensitive ---
-                const todosChannel = client.channel('rt-portal-todos')
-                    .on('postgres_changes', { event: '*', schema: 'public', table: 'todos' }, () => {
-                        _rtDebounce('todos', () => loadTodos(true, true), 300);
-                    })
-                    .subscribe((status) => {
-                        if (status === 'SUBSCRIBED') console.log('✅ Realtime: todos');
-                        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') _startFallbackPolling('todos');
-                    });
-                realtimeChannels.push(todosChannel);
+                // --- CAMPAIGNS: Refresh every 12 seconds ---
+                globalRefreshIntervals.campaigns = setInterval(() => {
+                    if (!authToken) return;
+                    if (typeof loadAllCampaigns === 'function') {
+                        loadAllCampaigns(true, true);
+                    }
+                }, 12000);
 
-                // --- ACCOUNTS ---
-                const accountsChannel = client.channel('rt-portal-accounts')
-                    .on('postgres_changes', { event: '*', schema: 'public', table: 'accounts' }, () => {
-                        _rtDebounce('accounts', () => loadAccounts(true, true), 500);
-                    })
-                    .subscribe((status) => {
-                        if (status === 'SUBSCRIBED') console.log('✅ Realtime: accounts');
-                        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') _startFallbackPolling('accounts');
-                    });
-                realtimeChannels.push(accountsChannel);
+                // --- USERS: Refresh every 15 seconds (Manager/Super Manager/Admin only) ---
+                if (currentUser && (currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin')) {
+                    globalRefreshIntervals.users = setInterval(() => {
+                        if (!authToken) return;
+                        loadUsers(true, true);
+                    }, 15000);
 
-                // --- CAMPAIGNS (campaign_conditions table) ---
-                const campaignsChannel = client.channel('rt-portal-campaigns')
-                    .on('postgres_changes', { event: '*', schema: 'public', table: 'campaign_conditions' }, () => {
-                        _rtDebounce('campaigns', () => { if (typeof loadAllCampaigns === 'function') loadAllCampaigns(true, true); }, 600);
-                    })
-                    .subscribe((status) => {
-                        if (status === 'SUBSCRIBED') console.log('✅ Realtime: campaigns');
-                    });
-                realtimeChannels.push(campaignsChannel);
+                    // --- WORKFLOWS: Refresh every 15 seconds (Manager only) ---
+                    globalRefreshIntervals.workflows = setInterval(() => {
+                        if (!authToken) return;
+                        loadWorkflows(true, true);
+                    }, 15000);
 
-                // --- MANAGER-ONLY tables ---
-                const isManagerRole = currentUser && (
-                    currentUser.role === 'Manager' || currentUser.role === 'Super Manager' ||
-                    currentUser.username === 'admin' || currentUser.role === 'Admin'
-                );
-                if (isManagerRole) {
-                    const usersChannel = client.channel('rt-portal-users')
-                        .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, () => {
-                            _rtDebounce('users', () => loadUsers(true, true), 600);
-                        })
-                        .subscribe((status) => {
-                            if (status === 'SUBSCRIBED') console.log('✅ Realtime: users');
-                            if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') _startFallbackPolling('users');
+                    // --- RULES: Refresh every 20 seconds (Manager only) ---
+                    globalRefreshIntervals.rules = setInterval(() => {
+                        if (!authToken) return;
+                        loadRules(true);
+                    }, 20000);
+
+                    // --- DEPARTMENTS: Initialize cache and refresh every 10 seconds (Manager only) ---
+                    // Initialize cache immediately
+                    refreshDepartmentsCache(true);
+
+                    globalRefreshIntervals.departments = setInterval(() => {
+                        if (!authToken) return;
+                        // Always refresh cache in background to keep dropdowns updated
+                        refreshDepartmentsCache(false, function (departments) {
+                            // Update departments table if section is active
+                            const activeSection = document.querySelector('.content-section.active');
+                            if (activeSection && activeSection.id === 'departmentsSection') {
+                                renderDepartmentsTable(departments);
+                                const badge = document.getElementById('departmentsCount');
+                                if (badge) badge.textContent = departments?.length || 0;
+                            }
                         });
-                    realtimeChannels.push(usersChannel);
+                    }, 10000); // Refresh every 10 seconds for faster updates
 
-                    const deptsChannel = client.channel('rt-portal-departments')
-                        .on('postgres_changes', { event: '*', schema: 'public', table: 'departments' }, () => {
-                            _rtDebounce('departments', () => refreshDepartmentsCache(true), 500);
-                        })
-                        .subscribe((status) => {
-                            if (status === 'SUBSCRIBED') console.log('✅ Realtime: departments');
-                        });
-                    realtimeChannels.push(deptsChannel);
-
-                    const lookerChannel = client.channel('rt-portal-looker')
-                        .on('postgres_changes', { event: '*', schema: 'public', table: 'looker_reports' }, () => {
-                            _rtDebounce('looker', () => loadLookerReports(true, true), 800);
-                        })
-                        .subscribe();
-                    realtimeChannels.push(lookerChannel);
-                }
-
-                console.log('⚡ Realtime subscriptions active — portal updates only on DB changes');
-            }
-
-            // Fallback: minimal polling used only when a realtime channel fails
-            function _startFallbackPolling(key) {
-                if (globalRefreshIntervals[key]) return; // already running
-                const fallbacks = {
-                    todos:    [() => loadTodos(true, true),    20000],
-                    accounts: [() => loadAccounts(true, true), 30000],
-                    users:    [() => loadUsers(true, true),    60000],
-                };
-                if (!key) {
-                    // All-fallback: used when Supabase is unavailable
-                    Object.entries(fallbacks).forEach(([k, [fn, interval]]) => {
-                        if (!globalRefreshIntervals[k]) {
-                            globalRefreshIntervals[k] = setInterval(() => { if (authToken) fn(); }, interval);
+                    // --- TEAM: Refresh every 8 seconds (live KPI cards) ---
+                    globalRefreshIntervals.team = setInterval(() => {
+                        if (!authToken) return;
+                        const activeSection = document.querySelector('.content-section.active');
+                        if (activeSection && activeSection.id === 'teamSection') {
+                            loadTeamMembers(true);
                         }
-                    });
-                    return;
+                    }, 8000);
                 }
-                const entry = fallbacks[key];
-                if (entry) {
-                    console.warn(`⚠️ Realtime failed for '${key}', falling back to ${entry[1] / 1000}s polling`);
-                    globalRefreshIntervals[key] = setInterval(() => { if (authToken) entry[0](); }, entry[1]);
-                }
+
+                // --- LOOKER REPORTS: Refresh every 20 seconds ---
+                globalRefreshIntervals.looker = setInterval(() => {
+                    if (!authToken) return;
+                    loadLookerReports(true, true);
+                }, 20000);
+
+                // --- TODOS: Refresh every 6 seconds (most time-sensitive) ---
+                globalRefreshIntervals.todos = setInterval(() => {
+                    if (!authToken) return;
+                    loadTodos(true, true);
+                }, 6000);
+
+                // --- BADGE COUNTS: Update every 10 seconds ---
+                globalRefreshIntervals.counts = setInterval(() => {
+                    if (!authToken) return;
+                    updateCounts();
+                }, 10000);
+
+                // Auto-refresh started for all sections
             }
 
             function stopSectionAutoRefresh() {
-                // Clear fallback intervals
-                Object.values(globalRefreshIntervals).forEach(id => { if (id) clearInterval(id); });
-                globalRefreshIntervals = {};
-
-                // Unsubscribe all realtime channels
-                const client = getSupabase();
-                realtimeChannels.forEach(ch => {
-                    try { if (client) client.removeChannel(ch); } catch (e) { /* ignore */ }
+                Object.values(globalRefreshIntervals).forEach(interval => {
+                    if (interval) clearInterval(interval);
                 });
-                realtimeChannels = [];
+                globalRefreshIntervals = {};
             }
 
             function refreshUsers() {
@@ -26872,18 +26795,11 @@
                         departmentsCache.data = depts;
                     }
 
-                    // Restrict department list based on role:
-                    // - Manager / Supervisor → only their own department(s)
-                    // - Super Manager / Admin → all departments (no filter)
-                    const userRole = (currentUser?.role || '');
-                    const isRestrictedRole = userRole === 'Manager' || userRole === 'Supervisor';
-                    if (isRestrictedRole && currentUser?.department) {
-                        const ownDepts = new Set(
-                            (currentUser.department || '').split(',').map(d => d.trim().toLowerCase()).filter(Boolean)
-                        );
+                    // Filter departments to only show those of team members
+                    if (teamMemberDepts.size > 0) {
                         depts = depts.filter(d => {
-                            const deptName = (d.name || d).toString().trim().toLowerCase();
-                            return ownDepts.has(deptName);
+                            const deptName = (d.name || d).toString().trim();
+                            return teamMemberDepts.has(deptName);
                         });
                     }
 
