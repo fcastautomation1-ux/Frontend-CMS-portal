@@ -47,17 +47,49 @@
         })();
 
         // ================================================================
-        // CONFIGURATION
+        // CONFIGURATION - Loaded from server (not hardcoded)
         // ================================================================
-        // NOTE: This is a fallback config. The app will try to sync the live
-        // config from Apps Script Script Properties after login.
-        let SUPABASE_CONFIG = {
-            url: 'https://nxvfotgayhxxmparvois.supabase.co',
-            anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im54dmZvdGdheWh4eG1wYXJ2b2lzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzMxNTUxMywiZXhwIjoyMDgyODkxNTEzfQ.pLc__SJjS28wLSWOPn4AfQe8W3JTU9kA4uEtZv5xvlY'
-        };
+        let SUPABASE_CONFIG = null; // Will be fetched from server
 
         // Legacy flag (not currently used elsewhere, but kept for compatibility)
         const USE_DIRECT_SUPABASE = true;
+
+        // ================================================================
+        // CONFIG FETCHER - Get credentials from Apps Script
+        // ================================================================
+        function fetchSupabaseConfig() {
+          return new Promise((resolve, reject) => {
+            // First try to get from Apps Script
+            if (typeof google !== 'undefined' && google.script && google.script.run) {
+              google.script.run
+                .withSuccessHandler((config) => {
+                  if (config && config.url && config.anonKey) {
+                    applySupabaseConfig(config, 'server');
+                    resolve(config);
+                  } else {
+                    reject(new Error('Invalid config from server'));
+                  }
+                })
+                .withFailureHandler((error) => {
+                  reject(error);
+                })
+                .getSupabaseConfig();
+            } else {
+              reject(new Error('Google Script API not available'));
+            }
+          });
+        }
+
+        // Initialize config on load
+        (async function initConfig() {
+          try {
+            await fetchSupabaseConfig();
+            console.log('✅ Supabase config loaded from server');
+          } catch (e) {
+            console.warn('Could not load config from server, using fallback');
+            // Config will be loaded after login via GAS call
+          }
+        })();
 
         // ================================================================
         // SUPABASE CLIENT
@@ -273,17 +305,26 @@
             setTimeout(ensureDatabaseSchema, 1000);
         };
 
-        // Token helpers
-        const TOKEN_MAX_AGE = 9 * 60 * 60 * 1000;
-        function generateToken(username, role) {
-            return btoa(`${username}:${Date.now()}:${role}`);
+        // Token helpers - Simple format (matching backend)
+        const TOKEN_MAX_AGE = 24 * 60 * 60 * 1000;
+
+        async function generateToken(username, role) {
+            const timestamp = Date.now();
+            const tokenStr = username + ':' + timestamp + ':' + role;
+            return btoa(tokenStr);
         }
-        function parseToken(token) {
+
+        async function parseToken(token) {
             try {
-                const [username, ts, role] = atob(token).split(':');
-                if (Date.now() - parseInt(ts) > TOKEN_MAX_AGE) return null;
-                return { username, role };
-            } catch { return null; }
+                if (!token) return null;
+                const decoded = atob(token);
+                const parts = decoded.split(':');
+                if (parts.length < 3) return null;
+                
+                return { username: parts[0], role: parts[2] };
+            } catch (e) {
+                return null;
+            }
         }
         function parseAllowed(str, role, username) {
             // Admin username, Admin role, and Super Manager always have full access
@@ -729,12 +770,59 @@
                         return { success: false, error: 'Database connection not available. Please refresh the page.' };
                     }
                     const users = await directDB.select('users', { username });
-                    if (!users?.length || users[0].password !== password)
+                    if (!users?.length) {
                         return { success: false, error: 'Invalid username or password' };
+                    }
+                    
                     const u = users[0];
+                    
+                    // Verify password (support both legacy and hashed passwords)
+                    let passwordValid = false;
+                    try {
+                        if (u.password_salt && u.password_hash) {
+                            // New hashed password format - verify using client-side hashing
+                            const salt = u.password_salt;
+                            const combined = 'GASv1_' + salt + password;
+                            const encoder = new TextEncoder();
+                            const data = encoder.encode(combined);
+                            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                            const hashArray = Array.from(new Uint8Array(hashBuffer));
+                            const hash = hashArray.map(b => ('0' + b.toString(16)).slice(-2)).join('');
+                            passwordValid = (hash === u.password_hash);
+                        } else if (u.password === password) {
+                            // Legacy plain-text password
+                            passwordValid = true;
+                            // Try to upgrade to hashed password (ignore errors)
+                            try {
+                                const salt = crypto.randomUUID();
+                                const combined = 'GASv1_' + salt + password;
+                                const encoder = new TextEncoder();
+                                const data = encoder.encode(combined);
+                                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                                const hash = hashArray.map(b => ('0' + b.toString(16)).slice(-2)).join('');
+                                
+                                // Update password to hashed format
+                                directDB.update('users', { 
+                                    password_hash: hash, 
+                                    password_salt: salt 
+                                }, { username }).catch(() => {});
+                            } catch (e) {
+                                console.log('Password upgrade skipped');
+                            }
+                        }
+                    } catch (e) {
+                        // If columns don't exist, fall back to plain text
+                        passwordValid = (u.password === password);
+                    }
+                    
+                    if (!passwordValid) {
+                        return { success: false, error: 'Invalid username or password' };
+                    }
+                    
                     directDB.update('users', { last_login: new Date().toISOString() }, { username }).catch(() => { });
                     return {
-                        success: true, token: generateToken(u.username, u.role),
+                        success: true, token: await generateToken(u.username, u.role),
                         user: {
                             username: u.username,
                             role: u.role,
@@ -756,11 +844,24 @@
             async changePassword(newPassword, token) {
                 const user = await this.validateToken(token);
                 if (!user) throw new Error('Unauthorized');
-                await directDB.update('users', { password: newPassword }, { username: user.username });
+                
+                // Hash the new password
+                const salt = crypto.randomUUID();
+                const combined = 'GASv1_' + salt + newPassword;
+                const encoder = new TextEncoder();
+                const data = encoder.encode(combined);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                const hash = hashArray.map(b => ('0' + b.toString(16)).slice(-2)).join('');
+                
+                await directDB.update('users', { 
+                    password_hash: hash, 
+                    password_salt: salt 
+                }, { username: user.username });
                 return true;
             },
             async validateToken(token) {
-                const p = parseToken(token); if (!p) return null;
+                const p = await parseToken(token); if (!p) return null;
                 // Use USER_AUTH_COLUMNS to avoid pulling avatar_data on every auth check.
                 const users = await directDB.select('users', { username: p.username }, USER_AUTH_COLUMNS);
                 if (!users?.length) return null;
@@ -792,9 +893,9 @@
                 let callerDepartment = null;
                 let hasLimitedUserAccess = false;
                 if (isManager) {
-                    // Admin always sees all users - no module access filtering needed
-                    if (caller.username === 'admin' || caller.role === 'Admin') {
-                        // No filtering - admin sees all users
+                    // Admin and Super Manager always see all users - no module access filtering needed
+                    if (caller.username === 'admin' || caller.role === 'Admin' || caller.role === 'Super Manager') {
+                        // No filtering - admin and super manager see all users
                     } else {
                         // Check both moduleAccess and module_access (camelCase and snake_case)
                         const moduleAccessStr = caller.moduleAccess || caller.module_access;
@@ -890,9 +991,10 @@
                 const caller = await this.validateToken(token);
                 if (!caller) throw new Error('Unauthorized');
 
-                // Only Super Managers can access this
-                if (caller.role !== 'Super Manager') {
-                    throw new Error('Only Super Managers can view task analytics');
+                // Super Managers and Admins can access this
+                const isAdminCaller = caller.username === 'admin' || caller.role === 'Admin';
+                if (caller.role !== 'Super Manager' && !isAdminCaller) {
+                    throw new Error('Only Super Managers and Admins can view task analytics');
                 }
 
                 try {
@@ -981,6 +1083,16 @@
                 if (!user) throw new Error('Unauthorized');
 
                 const client = getSupabase();
+
+                // Super Manager and Admin: return count of ALL users (excluding self)
+                const isAdminOrSuperManager = user.username === 'admin' || user.role === 'Super Manager' || user.role === 'Admin';
+                if (isAdminOrSuperManager) {
+                    const { data: allUsers } = await client
+                        .from('users')
+                        .select('username');
+                    const me = (user.username || '').toLowerCase();
+                    return (allUsers || []).filter(u => (u.username || '').toLowerCase() !== me).length;
+                }
 
                 // Support multiple managers AND explicit team_members lists.
                 // Team = union( users where manager_id contains me, users listed in my team_members )
@@ -1926,17 +2038,34 @@
                 try {
                     const client = getSupabase();
 
-                    // MANDATORY VISIBILITY - Task is visible to:
-                    // 1. Task creator (username)
-                    // 2. Task assignee (assigned_to)
-                    // 3. Creator's manager (users.manager_id lookup - supports multiple managers)
-                    // 4. Assignee's manager (manager_id on task OR users.manager_id lookup)
-                    // 5. Any user in the assignment chain
-                    // 6. Explicitly shared users (todo_shares)
-
-                    // First, find all users I manage (check if my username is in their manager_id field)
-                    // With multiple managers support, we need to check if user.username is contained in manager_id
-                    const { data: allUsers } = await client.from('users').select('username, manager_id');
+                    // Admin and Super Manager: fetch ALL todos so member filter works correctly
+                    const isAdminOrSuperManager = user.username === 'admin' || user.role === 'Super Manager' || user.role === 'Admin';
+                    
+                    // Fetch users with department info for mapping
+                    const { data: allUsers } = await client.from('users').select('username, manager_id, team_members, department');
+                    
+                    // Create department map for all users
+                    const userDeptMap = {};
+                    (allUsers || []).forEach(u => {
+                        if (u.username && u.department) {
+                            userDeptMap[u.username.toLowerCase()] = u.department;
+                        }
+                    });
+                    
+                    if (isAdminOrSuperManager) {
+                        const { data: allTodosData, error: allTodosError } = await client.from('todos').select('*');
+                        if (allTodosError) throw allTodosError;
+                        // Also fetch shared todos so shared flags work
+                        const { data: sharedData } = await client.from('todo_shares').select('todo_id').eq('shared_with', user.username);
+                        const sharedIds = new Set((sharedData || []).map(s => s.todo_id));
+                        return (allTodosData || []).map(t => ({
+                            ...t,
+                            is_shared: sharedIds.has(t.id) || undefined,
+                            creator_department: userDeptMap[t.username?.toLowerCase()] || null,
+                            assignee_department: userDeptMap[t.assigned_to?.toLowerCase()] || null
+                        }));
+                    }
+                    
                     const myTeamUsernames = (allUsers || [])
                         .filter(u => {
                             if (!u.manager_id) return false;
@@ -1944,6 +2073,14 @@
                             return managers.includes(user.username.toLowerCase());
                         })
                         .map(u => u.username);
+
+                    // Also include users in explicit team_members list
+                    const myRow = (allUsers || []).find(u => (u.username || '').toLowerCase() === user.username.toLowerCase());
+                    const explicitTeam = ((myRow?.team_members || '').toString())
+                        .split(',').map(s => s.trim()).filter(Boolean);
+                    explicitTeam.forEach(m => {
+                        if (m && !myTeamUsernames.includes(m)) myTeamUsernames.push(m);
+                    });
 
                     // Run all queries in parallel for performance
                     const [ownedResult, assignedResult, completedByResult, sharedResult, deptQueuedResult] = await Promise.all([
@@ -1975,7 +2112,12 @@
                     // Helper to add task without duplicates
                     const addTask = (task, flags = {}) => {
                         if (!taskIds.has(task.id)) {
-                            allTasks.push({ ...task, ...flags });
+                            allTasks.push({ 
+                                ...task, 
+                                ...flags,
+                                creator_department: userDeptMap[task.username?.toLowerCase()] || null,
+                                assignee_department: userDeptMap[task.assigned_to?.toLowerCase()] || null
+                            });
                             taskIds.add(task.id);
                         }
                     };
@@ -2033,6 +2175,29 @@
                         }
                     } catch (chainQueryErr) {
                         // Silently skip if assignment_chain column doesn't exist yet
+                    }
+
+                    // 8. Multi-assignment tasks where I am one of the assignees
+                    try {
+                        // PostgreSQL JSONB: retrieve ALL tasks with multi_assignment enabled, then filter client-side
+                        // This is more reliable than JSONB text search which can be unpredictable
+                        const { data: allMaTasksData, error: maErr } = await client.from('todos')
+                            .select('*')
+                            .not('multi_assignment', 'is', null);
+                        
+                        if (!maErr && allMaTasksData) {
+                            allMaTasksData.forEach(t => {
+                                try {
+                                    const ma = typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : (t.multi_assignment || {});
+                                    if (ma.enabled && Array.isArray(ma.assignees) && ma.assignees.some(a => (a.username || '').toLowerCase() === user.username.toLowerCase())) {
+                                        addTask(t, { is_multi_assigned: true });
+                                    }
+                                } catch(e) { /* ignore parse errors */ }
+                            });
+                        }
+                    } catch(maQueryErr) {
+                        // Silently skip if multi_assignment column doesn't exist yet
+                        console.warn('Multi-assignment query failed (column may not exist):', maQueryErr);
                     }
 
                     // 7. Shared tasks
@@ -2102,6 +2267,7 @@
                     archived: todoData.archived !== undefined ? todoData.archived : false,
                     queue_department: todoData.queue_department || null,
                     queue_status: todoData.queue_status || null,
+                    multi_assignment: todoData.multi_assignment || { enabled: false, assignees: [] },
                     updated_at: now
                 };
 
@@ -2718,11 +2884,25 @@
                 const { data: task } = taskResult;
                 if (!task) return null;
 
-                // ACCESS CHECK: Only creator, assignee, their managers, chain members, or shared users can view this task
+                // ACCESS CHECK: Only creator, assignee, their managers, chain members, shared users, or multi-assignees can view this task
                 const isCreator = task.username === user.username;
                 const isAssignee = task.assigned_to === user.username;
                 const isAssigneeManager = isUserInManagerList(task.manager_id, user.username);
                 const isSharedWith = sharesResult.data && sharesResult.data.some(s => s.shared_with === user.username);
+
+                // Check if user is a multi-assignment assignee
+                let isMultiAssignee = false;
+                try {
+                    const ma = task.multi_assignment
+                        ? (typeof task.multi_assignment === 'string' ? JSON.parse(task.multi_assignment) : task.multi_assignment)
+                        : null;
+                    if (ma && ma.enabled && Array.isArray(ma.assignees)) {
+                        isMultiAssignee = ma.assignees.some(a => (a.username || '').toLowerCase() === user.username.toLowerCase());
+                    }
+                } catch (e) {
+                    // If parsing fails, log it for debugging
+                    console.error('Error parsing multi_assignment for task:', todoId, e);
+                }
 
                 // Check if user is in the assignment chain
                 let isChainMember = false;
@@ -2739,7 +2919,10 @@
                 // Legacy fallback: manager's team_members list contains creator/assignee
                 let isManagerByTeamMembers = false;
 
-                if (!isCreator && !isAssignee && !isAssigneeManager && !isSharedWith && !isChainMember) {
+                // Admin and Super Manager always have access
+                const isAdminOrSM = user.username === 'admin' || user.role === 'Super Manager' || user.role === 'Admin';
+
+                if (!isCreator && !isAssignee && !isAssigneeManager && !isSharedWith && !isChainMember && !isMultiAssignee && !isAdminOrSM) {
                     const [creatorLookup, assigneeLookup] = await Promise.all([
                         client.from('users').select('manager_id').eq('username', task.username).single(),
                         task.assigned_to ? client.from('users').select('manager_id').eq('username', task.assigned_to).single() : Promise.resolve({ data: null })
@@ -2766,7 +2949,7 @@
                     }
                 }
 
-                if (!isCreator && !isAssignee && !isAssigneeManager && !isCreatorManager && !isAssigneeManagerViaLookup && !isManagerByTeamMembers && !isSharedWith && !isChainMember) {
+                if (!isAdminOrSM && !isCreator && !isAssignee && !isMultiAssignee && !isAssigneeManager && !isCreatorManager && !isAssigneeManagerViaLookup && !isManagerByTeamMembers && !isSharedWith && !isChainMember) {
                     throw new Error('Access denied: You do not have permission to view this task');
                 }
 
@@ -2780,8 +2963,10 @@
 
                 const currentUserShare = (sharesResult.data || []).find(s => s.shared_with === user.username) || null;
                 const currentUserCanEdit =
+                    isAdminOrSM ||
                     isCreator ||
                     isAssignee ||
+                    isMultiAssignee ||
                     isAssigneeManager ||
                     isCreatorManager ||
                     isAssigneeManagerViaLookup ||
@@ -2806,16 +2991,27 @@
                 if (!user) throw new Error('Unauthorized');
 
                 const client = getSupabase();
-                const { data: task } = await client.from('todos').select('history, title, username, assigned_to, manager_id').eq('id', todoId).single();
+                const { data: task } = await client.from('todos').select('history, title, username, assigned_to, manager_id, multi_assignment').eq('id', todoId).single();
                 if (!task) throw new Error('Task not found');
 
-                // ACCESS CHECK: Only creator, assignee, their managers, or shared users can comment
+                // ACCESS CHECK: Only creator, assignee, their managers, shared users, chain/multi-assignees can comment
                 const isCreator = task.username === user.username;
                 const isAssignee = task.assigned_to === user.username;
                 const isTaskManager = isUserInManagerList(task.manager_id, user.username);
+                const isAdminOrSMComment = user.username === 'admin' || user.role === 'Super Manager' || user.role === 'Admin';
+                // Check multi-assignment
+                let isMultiAssigneeComment = false;
+                try {
+                    const maRaw = task.multi_assignment
+                        ? (typeof task.multi_assignment === 'string' ? JSON.parse(task.multi_assignment) : task.multi_assignment)
+                        : null;
+                    if (maRaw?.enabled && Array.isArray(maRaw.assignees)) {
+                        isMultiAssigneeComment = maRaw.assignees.some(a => (a.username||'').toLowerCase() === user.username.toLowerCase());
+                    }
+                } catch(e) {}
                 // Check if user is the creator's manager
                 let isCreatorManager = false;
-                if (!isCreator && !isAssignee && !isTaskManager) {
+                if (!isCreator && !isAssignee && !isTaskManager && !isAdminOrSMComment && !isMultiAssigneeComment) {
                     const { data: creatorUser } = await client.from('users')
                         .select('manager_id')
                         .eq('username', task.username)
@@ -2824,7 +3020,7 @@
                         isCreatorManager = true;
                     }
                 }
-                if (!isCreator && !isAssignee && !isTaskManager && !isCreatorManager) {
+                if (!isCreator && !isAssignee && !isTaskManager && !isCreatorManager && !isAdminOrSMComment && !isMultiAssigneeComment) {
                     // Check shares
                     const { data: shareCheck } = await client.from('todo_shares')
                         .select('can_edit')
@@ -9735,7 +9931,7 @@
                                     </select>
                                     <select id="teamFilterDate" onchange="loadTeamMembers(true)"
                                         class="team-filter-select">
-                                        <option value="all">Date filter</option>
+                                        <option value="all">📅 Task date range</option>
                                         <option value="today">Today</option>
                                         <option value="last7days">Last 7 Days</option>
                                         <option value="last30days">Last 30 Days</option>
@@ -10634,11 +10830,49 @@
                                             </select>
                                             <div style="margin-top: 6px; font-size: 11px; color: #64748b;">💡 Only showing users who manage at least one team member.</div>
                                         </div>
+
+                                        <!-- ===== Multi-Assignment Card ===== -->
+                                        <div id="routeCardMulti" onclick="selectRouting('multi')"
+                                            style="display: flex; align-items: center; gap: 14px; padding: 14px 18px; border: 2px solid #e2e8f0; border-radius: 12px; cursor: pointer; transition: all 0.2s ease; background: white;"
+                                            onmouseover="if(!this.classList.contains('route-selected')){this.style.borderColor='#06b6d4';this.style.background='#ecfeff';}"
+                                            onmouseout="if(!this.classList.contains('route-selected')){this.style.borderColor='#e2e8f0';this.style.background='white';}">
+                                            <div style="width: 42px; height: 42px; border-radius: 12px; background: linear-gradient(135deg, #cffafe, #a5f3fc); display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0;">👥</div>
+                                            <div style="flex: 1; min-width: 0;">
+                                                <div style="font-weight: 700; color: #1e293b; font-size: 14px;">Multi-Assignment <span style="font-size: 10px; background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 4px; font-weight: 700; margin-left: 4px;">NEW</span></div>
+                                                <div style="font-size: 12px; color: #64748b; margin-top: 2px;">Send this task to multiple users at once</div>
+                                            </div>
+                                            <div id="routeCheckMulti" style="width: 22px; height: 22px; border-radius: 50%; border: 2px solid #d1d5db; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.2s;"></div>
+                                        </div>
+
+                                        <!-- Multi-Assignment user selector panel -->
+                                        <div id="todoMultiRoutingDetails" style="display: none; margin-top: 4px;">
+                                            <div style="background: #ecfeff; border: 2px solid #a5f3fc; border-radius: 12px; padding: 14px;">
+                                                <div style="font-weight: 700; color: #0e7490; font-size: 13px; margin-bottom: 10px;">👥 Select Users to Assign</div>
+                                                <div style="display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
+                                                    <input type="text" id="maSearchInput" placeholder="🔍 Search users..." oninput="maFilterUsers()"
+                                                        style="flex: 1; min-width: 150px; padding: 8px 12px; border: 1.5px solid #a5f3fc; border-radius: 8px; font-size: 13px; outline: none;"
+                                                        onfocus="this.style.borderColor='#06b6d4';" onblur="this.style.borderColor='#a5f3fc';">
+                                                    <select id="maDeptFilter" onchange="maFilterUsers()"
+                                                        style="flex: 1; min-width: 150px; padding: 8px 12px; border: 1.5px solid #a5f3fc; border-radius: 8px; font-size: 13px; cursor: pointer;">
+                                                        <option value="all">🏢 All Departments</option>
+                                                    </select>
+                                                </div>
+                                                <div style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
+                                                    <button type="button" onclick="maSelectAll()" style="padding: 5px 12px; background: #06b6d4; color: white; border: none; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer;">✅ Select All</button>
+                                                    <button type="button" onclick="maClearAll()" style="padding: 5px 12px; background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer;">🗑️ Clear</button>
+                                                    <span id="maSelectedCount" style="margin-left: auto; font-size: 12px; font-weight: 700; color: #0e7490;">0 selected</span>
+                                                </div>
+                                                <div id="maUserList" style="max-height: 220px; overflow-y: auto; background: white; border: 1.5px solid #e2e8f0; border-radius: 8px; padding: 6px;">
+                                                    <div style="text-align: center; padding: 20px; color: #94a3b8; font-size: 13px;">Loading users...</div>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                     <!-- Hidden inputs for form compatibility -->
                                     <input type="checkbox" id="todoSelfTodo" style="display: none;">
                                     <input type="radio" name="todoRouting" id="todoRouteDept" value="department" style="display: none;">
                                     <input type="radio" name="todoRouting" id="todoRouteManager" value="manager" style="display: none;">
+                                    <input type="radio" name="todoRouting" id="todoRouteMulti" value="multi" style="display: none;">
                                 </div>
 
                                 <!-- ===== Notes ===== -->
@@ -11919,6 +12153,94 @@
                         style="flex: 1; padding: 14px 20px; border: none; background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); border-radius: 12px; font-size: 15px; font-weight: 700; color: white; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 12px rgba(139,92,246,0.3);"
                         onmouseover="this.style.transform='translateY(-2px)';"
                         onmouseout="this.style.transform='translateY(0)';">✓ Complete Task</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Multi-Assignment Task Submission Feedback Modal -->
+    <div id="maSubmissionFeedbackModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 600px; width: 90%; border-radius: 20px; overflow: hidden;">
+            <div style="background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); padding: 24px 28px; display: flex; align-items: center; gap: 16px;">
+                <div style="width: 56px; height: 56px; background: rgba(255,255,255,0.2); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px;">⚡</div>
+                <div>
+                    <h3 style="margin: 0; color: white; font-size: 20px; font-weight: 800;">Submit Task for Review</h3>
+                    <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.8); font-size: 14px;">Provide your feedback before submitting</p>
+                </div>
+            </div>
+            <div style="padding: 28px;">
+                <p style="margin: 0 0 16px 0; color: #475569; font-size: 15px; line-height: 1.6;">
+                    <strong id="maSubmissionTaskTitle" style="color: #1e293b;"></strong> is now ready to be reviewed by the task creator.
+                </p>
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: #1e293b; font-weight: 700; font-size: 14px;">
+                        Work Completed & Feedback <span style="color: #ef4444;">*</span>
+                    </label>
+                    <textarea id="maSubmissionFeedback" placeholder="Describe what you completed, results achieved, or any important notes for the creator..." rows="4"
+                        style="width: 100%; padding: 14px 16px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 14px; resize: vertical; font-family: inherit; transition: all 0.2s; box-sizing: border-box;"
+                        onfocus="this.style.borderColor='#8b5cf6';"
+                        onblur="this.style.borderColor='#e2e8f0';"></textarea>
+                    <div id="maSubmissionFeedbackError" style="display: none; color: #ef4444; font-size: 12px; margin-top: 6px; font-weight: 700;">
+                        ⚠️ Please provide your feedback before submitting
+                    </div>
+                </div>
+                <div style="padding: 14px 16px; background: #fef3c7; border-radius: 10px; color: #92400e; font-size: 13px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 24px;">
+                    <span style="font-size: 18px; flex-shrink: 0;">💡</span>
+                    <span>Your feedback will be visible to the task creator for review and approval.</span>
+                </div>
+                <div style="display: flex; gap: 12px;">
+                    <button onclick="closeMaSubmissionFeedbackModal()"
+                        style="flex: 1; padding: 14px 20px; border: 2px solid #e2e8f0; background: white; border-radius: 12px; font-size: 15px; font-weight: 700; color: #64748b; cursor: pointer; transition: all 0.2s;"
+                        onmouseover="this.style.background='#f8fafc';"
+                        onmouseout="this.style.background='white';">Cancel</button>
+                    <button id="confirmMaSubmissionBtn" onclick="confirmMaSubmissionFeedback()"
+                        style="flex: 1; padding: 14px 20px; border: none; background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); border-radius: 12px; font-size: 15px; font-weight: 700; color: white; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 12px rgba(139,92,246,0.3);"
+                        onmouseover="this.style.transform='translateY(-2px)';"
+                        onmouseout="this.style.transform='translateY(0)';">✓ Submit Feedback</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Multi-Assignment Reopen Feedback Modal -->
+    <div id="maReopenFeedbackModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 600px; width: 90%; border-radius: 20px; overflow: hidden;">
+            <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 24px 28px; display: flex; align-items: center; gap: 16px;">
+                <div style="width: 56px; height: 56px; background: rgba(255,255,255,0.2); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px;">🔓</div>
+                <div>
+                    <h3 style="margin: 0; color: white; font-size: 20px; font-weight: 800;">Reopen Task Work</h3>
+                    <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.8); font-size: 14px;">Request changes or improvements</p>
+                </div>
+            </div>
+            <div style="padding: 28px;">
+                <p style="margin: 0 0 16px 0; color: #475569; font-size: 15px; line-height: 1.6;">
+                    Reopening work for <strong id="maReopenAssigneeName" style="color: #1e293b;"></strong>
+                </p>
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: #1e293b; font-weight: 700; font-size: 14px;">
+                        Reopen Feedback (Changes Required) <span style="color: #ef4444;">*</span>
+                    </label>
+                    <textarea id="maReopenFeedback" placeholder="Explain what needs to be changed, improved, or corrected..." rows="4"
+                        style="width: 100%; padding: 14px 16px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 14px; resize: vertical; font-family: inherit; transition: all 0.2s; box-sizing: border-box;"
+                        onfocus="this.style.borderColor='#f59e0b';"
+                        onblur="this.style.borderColor='#e2e8f0';"></textarea>
+                    <div id="maReopenFeedbackError" style="display: none; color: #ef4444; font-size: 12px; margin-top: 6px; font-weight: 700;">
+                        ⚠️ Please provide feedback about what needs to be changed
+                    </div>
+                </div>
+                <div style="padding: 14px 16px; background: #fef3c7; border-radius: 10px; color: #92400e; font-size: 13px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 24px;">
+                    <span style="font-size: 18px; flex-shrink: 0;">💡</span>
+                    <span>The assignee will see your feedback and can make the requested changes.</span>
+                </div>
+                <div style="display: flex; gap: 12px;">
+                    <button onclick="closeMaReopenFeedbackModal()"
+                        style="flex: 1; padding: 14px 20px; border: 2px solid #e2e8f0; background: white; border-radius: 12px; font-size: 15px; font-weight: 700; color: #64748b; cursor: pointer; transition: all 0.2s;"
+                        onmouseover="this.style.background='#f8fafc';"
+                        onmouseout="this.style.background='white';">Cancel</button>
+                    <button id="confirmMaReopenBtn" onclick="confirmMaReopenFeedback()"
+                        style="flex: 1; padding: 14px 20px; border: none; background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border-radius: 12px; font-size: 15px; font-weight: 700; color: white; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 12px rgba(245,158,11,0.3);"
+                        onmouseover="this.style.transform='translateY(-2px)';"
+                        onmouseout="this.style.transform='translateY(0)';">✓ Reopen with Feedback</button>
                 </div>
             </div>
         </div>
@@ -15129,12 +15451,8 @@
                 const token = authToken;
                 if (!token) return;
 
-                // Super Manager and Admin always see the team section regardless of count
-                const isPrivileged = currentUser && (
-                    currentUser.username === 'admin' ||
-                    currentUser.role === 'Admin' ||
-                    currentUser.role === 'Super Manager'
-                );
+                const isAdminOrSuperManager = currentUser &&
+                    (currentUser.username === 'admin' || currentUser.role === 'Super Manager' || currentUser.role === 'Admin');
 
                 try {
                     const count = await directAPI.getTeamMembersCount(token);
@@ -15143,8 +15461,8 @@
 
                     if (teamNavItem && teamCountBadge) {
                         teamCountBadge.textContent = count;
-                        // Super Manager / Admin always see the team nav item
-                        if (isPrivileged || count > 0) {
+                        // Super Manager and Admin always see Team section
+                        if (isAdminOrSuperManager || count > 0) {
                             teamNavItem.style.display = 'flex';
                         } else {
                             teamNavItem.style.display = 'none';
@@ -15153,8 +15471,8 @@
                 } catch (error) {
                     console.error('Error loading team members count:', error);
                     const teamNavItem = document.querySelector('[data-section="team"]');
-                    // Super Manager / Admin keep the team nav visible even on error
-                    if (teamNavItem && !isPrivileged) teamNavItem.style.display = 'none';
+                    // For Super Manager and Admin, still show even if count fails
+                    if (teamNavItem) teamNavItem.style.display = isAdminOrSuperManager ? 'flex' : 'none';
                 }
             }
 
@@ -15180,6 +15498,8 @@
 
                 // Prevent multiple simultaneous calls
                 if (isLoadingTeamMembers) {
+                    // Filter changed while a load was in progress – retry after current finishes
+                    if (silentRefresh) window._pendingTeamRefresh = true;
                     console.log('loadTeamMembers already in progress, skipping...');
                     return;
                 }
@@ -15190,9 +15510,9 @@
                 const hasExistingContent = container.innerHTML.trim().length > 0;
                 if (!silentRefresh || !hasExistingContent) {
                     container.innerHTML = '<div style="text-align: center; padding: 40px; color: #64748b;"><div style="font-size: 48px; margin-bottom: 12px;">👥</div><div style="font-size: 16px; font-weight: 600;">Loading team members...</div></div>';
-                    // Clear cached render so new content always replaces the loading spinner
-                    delete container.dataset.lastTeamRender;
                 }
+                // Always clear cached render so filter/department/date changes force a fresh re-render
+                delete container.dataset.lastTeamRender;
 
                 isLoadingTeamMembers = true;
 
@@ -15233,15 +15553,11 @@
                     }
 
                     const meLower = (currentUser.username || '').toLowerCase();
-
-                    // Super Manager and Admin see all users automatically
-                    const isPrivilegedUser = currentUser.username === 'admin' ||
-                        currentUser.role === 'Admin' ||
-                        currentUser.role === 'Super Manager';
+                    const isAdminOrSuperManager = currentUser.username === 'admin' || currentUser.role === 'Super Manager' || currentUser.role === 'Admin';
 
                     let teamMembers;
-                    if (isPrivilegedUser) {
-                        // All users except self are shown as team members
+                    if (isAdminOrSuperManager) {
+                        // Super Manager and Admin: all users are team members automatically
                         teamMembers = (allUsersData || []).filter(u => (u.username || '').toLowerCase() !== meLower);
                     } else {
                         // Explicit team members (from my own team_members column)
@@ -15295,34 +15611,29 @@
                         return aliases[compact] || compact;
                     };
 
+                    // Date filter applies to task KPI stats — all members stay visible regardless of date
                     const filteredTeamMembers = teamMembers.filter(member => {
                         if (selectedDepartment !== 'all') {
                             const memberDepartment = normalizeDepartment(member.department);
                             const filterDepartment = normalizeDepartment(selectedDepartment);
                             if (memberDepartment !== filterDepartment) return false;
                         }
-
-                        if (selectedDate !== 'all') {
-                            if (!member.last_login) return false;
-                            const loginDate = new Date(member.last_login);
-
-                            if (selectedDate === 'today') {
-                                if (loginDate.toDateString() !== today.toDateString()) return false;
-                            } else if (selectedDate === 'last7days') {
-                                const sevenDaysAgo = new Date(today);
-                                sevenDaysAgo.setDate(today.getDate() - 7);
-                                if (loginDate < sevenDaysAgo) return false;
-                            } else if (selectedDate === 'last30days') {
-                                const thirtyDaysAgo = new Date(today);
-                                thirtyDaysAgo.setDate(today.getDate() - 30);
-                                if (loginDate < thirtyDaysAgo) return false;
-                            } else if (selectedDate === 'thismonth') {
-                                if (loginDate.getMonth() !== nowDate.getMonth() || loginDate.getFullYear() !== nowDate.getFullYear()) return false;
-                            }
-                        }
-
                         return true;
                     });
+
+                    // Helper: returns true if a todo's created_at falls in the selected date window
+                    const todoInDateRange = (todo) => {
+                        if (selectedDate === 'all') return true;
+                        const ref = todo.created_at || todo.due_date;
+                        if (!ref) return false;
+                        const d = new Date(ref);
+                        const dOnly = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+                        if (selectedDate === 'today') return dOnly.toDateString() === today.toDateString();
+                        if (selectedDate === 'last7days')  { const s = new Date(today); s.setDate(today.getDate() - 7);  return dOnly >= s; }
+                        if (selectedDate === 'last30days') { const s = new Date(today); s.setDate(today.getDate() - 30); return dOnly >= s; }
+                        if (selectedDate === 'thismonth')  return d.getMonth() === nowDate.getMonth() && d.getFullYear() === nowDate.getFullYear();
+                        return true;
+                    };
 
                     // Build live KPI stats for each direct team member
                     const now = new Date();
@@ -15339,7 +15650,7 @@
                     try {
                         const { data: todosData, error: todosError } = await client
                             .from('todos')
-                            .select('username, assigned_to, completed, due_date, task_status');
+                            .select('username, assigned_to, completed, due_date, task_status, created_at');
                         
                         if (todosError) {
                             console.warn('Error fetching todos for team stats (non-critical):', todosError);
@@ -15353,6 +15664,7 @@
                     }
 
                     (teamTodosRaw || []).forEach(todo => {
+                        if (!todoInDateRange(todo)) return; // skip tasks outside selected date window
                         const participants = [...new Set([todo.username, todo.assigned_to].filter(Boolean))];
                         participants.forEach(username => {
                             if (!teamMemberUsernames.has(username.toLowerCase())) return;
@@ -15401,7 +15713,7 @@
                     const nextHtml = filteredTeamMembers.map(member => `
                             <div class="team-member-card" data-username="${escapeHtml(member.username)}"
                                 style="background: white; border-radius: 14px; padding: 14px; border: 2px solid #e2e8f0; transition: all 0.2s; cursor: pointer;"
-                                onclick="filterByTeamMember('${escapeHtml(member.username)}')"
+                                onclick="openMemberDrawer('${escapeHtml(member.username)}', '${escapeHtml(member.role||'')}', '${escapeHtml(member.department||'')}', '${escapeHtml(member.email||'')}', '${escapeHtml(member.last_login||'')}', '${escapeHtml(member.skills||'')}')"
                                 onmouseover="this.style.borderColor='#6366F1'; this.style.boxShadow='0 4px 12px rgba(99, 102, 241, 0.15)';"
                                 onmouseout="if(!this.classList.contains('active-member')){this.style.borderColor='#e2e8f0'; this.style.boxShadow='none';}">
                                 ${(() => {
@@ -15423,6 +15735,11 @@
                                                 ${member.department ? `<span style="font-size: 12px; padding: 2px 10px; border-radius: 6px; background: #f0fdf4; color: #15803d; font-weight: 700;">
                                                     ${escapeHtml(member.department)}
                                                 </span>` : ''}
+                                            </div>
+                                            <div style="display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px;">
+                                                ${(member.skills || '').split(',').map(s => s.trim()).filter(Boolean).map(skill => `
+                                                    <span style="font-size: 10px; padding: 1px 6px; border-radius: 4px; background: #fef3c7; color: #92400e; border: 1px solid #fde68a;">${escapeHtml(skill)}</span>
+                                                `).join('')}
                                             </div>
                                             ${member.last_login ? `
                                                 <div style="font-size: 12px; color: #94a3b8;">
@@ -15504,6 +15821,11 @@
                 } finally {
                     // ALWAYS reset loading flag to prevent stuck state on any code path
                     isLoadingTeamMembers = false;
+                    // A filter change was queued while we were loading – run it now
+                    if (window._pendingTeamRefresh) {
+                        window._pendingTeamRefresh = false;
+                        setTimeout(() => loadTeamMembers(true), 80);
+                    }
                 }
             }
 
@@ -15512,41 +15834,40 @@
                 // Switch to todos section
                 showSection('todos');
 
-                // Reset quick filter to 'all' so team member view shows everything
+                // Reset quick filter to 'all' so all tasks for the member are shown
                 activeQuickFilter = 'all';
                 document.querySelectorAll('.todo-quick-filter-btn').forEach(btn => btn.classList.remove('active'));
                 const allBtn = document.getElementById('qfAllTasks');
                 if (allBtn) allBtn.classList.add('active');
 
-                // Set the team member filter dropdown
+                // Switch scope to 'team' so the filter logic shows all tasks for the selected member
+                const scopeFilter = document.getElementById('todoFilterScope');
+                if (scopeFilter) scopeFilter.value = 'team';
+
+                // Force manager filters group visible so team member filter is honoured
+                const managerFiltersGroup = document.getElementById('todoManagerFiltersGroup');
+                if (managerFiltersGroup) managerFiltersGroup.style.display = 'inline-flex';
+
+                // Set the team member filter dropdown — add option if not present
                 const dropdown = document.getElementById('todoFilterTeamMember');
                 if (dropdown) {
-                    // Make sure the option exists
                     let optionExists = false;
                     for (let i = 0; i < dropdown.options.length; i++) {
-                        if (dropdown.options[i].value === username) {
-                            optionExists = true;
-                            break;
-                        }
+                        if (dropdown.options[i].value === username) { optionExists = true; break; }
                     }
-
-                    // Add option if not yet populated
                     if (!optionExists) {
                         const option = document.createElement('option');
                         option.value = username;
                         option.textContent = '👤 ' + username;
                         dropdown.appendChild(option);
                     }
-
                     dropdown.value = username;
                 }
 
-                // Ensure list view is active for clearer manager review
-                if (typeof setTodoView === 'function') {
-                    setTodoView('list');
-                }
+                // Ensure list view
+                if (typeof setTodoView === 'function') setTodoView('list');
 
-                // Show clear selected-member banner
+                // Show selected-member banner
                 const selectedBanner = document.getElementById('todoSelectedMemberBanner');
                 if (selectedBanner) {
                     selectedBanner.innerHTML = `
@@ -15558,7 +15879,7 @@
                     selectedBanner.style.display = 'block';
                 }
 
-                // Always load/refresh todos to ensure data is fresh and filters are applied
+                // Load todos fresh so the full dataset is fetched for the selected member
                 loadTodos(true);
             }
 
@@ -23075,6 +23396,33 @@
                 if (statOverdue) statOverdue.textContent = stats.overdue;
                 if (statDueToday) statDueToday.textContent = stats.dueToday;
 
+                // Update KPI cards with same values
+                const kpiCardTotal = document.getElementById('kpiCardTotal');
+                const kpiCardCompleted = document.getElementById('kpiCardCompleted');
+                const kpiCardPending = document.getElementById('kpiCardPending');
+                const kpiCardInProgress = document.getElementById('kpiCardInProgress');
+                const kpiCardOverdue = document.getElementById('kpiCardOverdue');
+                const kpiCardDueToday = document.getElementById('kpiCardDueToday');
+                
+                if (kpiCardTotal?.querySelector('div[style*="font-size: 36px"]')) {
+                    kpiCardTotal.querySelector('div[style*="font-size: 36px"]').textContent = stats.total;
+                }
+                if (kpiCardCompleted?.querySelector('div[style*="font-size: 36px"]')) {
+                    kpiCardCompleted.querySelector('div[style*="font-size: 36px"]').textContent = stats.completed;
+                }
+                if (kpiCardPending?.querySelector('div[style*="font-size: 36px"]')) {
+                    kpiCardPending.querySelector('div[style*="font-size: 36px"]').textContent = stats.pending;
+                }
+                if (kpiCardInProgress?.querySelector('div[style*="font-size: 36px"]')) {
+                    kpiCardInProgress.querySelector('div[style*="font-size: 36px"]').textContent = stats.inProgress;
+                }
+                if (kpiCardOverdue?.querySelector('div[style*="font-size: 36px"]')) {
+                    kpiCardOverdue.querySelector('div[style*="font-size: 36px"]').textContent = stats.overdue;
+                }
+                if (kpiCardDueToday?.querySelector('div[style*="font-size: 36px"]')) {
+                    kpiCardDueToday.querySelector('div[style*="font-size: 36px"]').textContent = stats.dueToday;
+                }
+
                 // Update stats header to show whose stats are being displayed
                 const statsHeader = document.getElementById('todoStatsHeader');
                 if (statsHeader) {
@@ -23106,7 +23454,7 @@
                 const scopeFilter = document.getElementById('todoFilterScope');
                 const teamMemberFilter = document.getElementById('todoFilterTeamMember');
                 const managerFiltersGroup = document.getElementById('todoManagerFiltersGroup');
-                const isManager = currentUser && (currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin');
+                const isManager = currentUser && (currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.role === 'Admin' || currentUser.username === 'admin');
 
                 // Check if user has team members under them
                 let hasTeamMembers = false;
@@ -23169,34 +23517,39 @@
 
                 const currentValue = dropdown.value;
                 const meLower = (currentUser.username || '').toLowerCase();
+                const isAdminOrSM = currentUser.username === 'admin' || currentUser.role === 'Super Manager' || currentUser.role === 'Admin';
 
-                // Only show users who have the current user listed as their manager
-                const directReports = new Set();
-                if (window.allUsers && window.allUsers.length > 0) {
-                    window.allUsers.forEach(u => {
-                        if (!u.username || u.username === currentUser.username) return;
-                        const managers = (u.managerId || u.manager_id || '').split(',').map(m => m.trim().toLowerCase()).filter(Boolean);
-                        if (managers.includes(meLower)) {
-                            directReports.add(u.username);
-                        }
+                const memberSet = new Set();
+
+                if (isAdminOrSM) {
+                    // Admin & Super Manager: show every user
+                    (window.allUsers || []).forEach(u => {
+                        if (u && u.username && u.username !== currentUser.username) memberSet.add(u.username);
                     });
+                } else {
+                    // Others: reverse manager_id lookup + explicit team_members field
+                    (window.allUsers || []).forEach(u => {
+                        if (!u || !u.username || u.username === currentUser.username) return;
+                        const mgrs = (u.managerId || u.manager_id || '').split(',').map(m => m.trim().toLowerCase()).filter(Boolean);
+                        if (mgrs.includes(meLower)) memberSet.add(u.username);
+                    });
+                    const myRow = (window.allUsers || []).find(u => (u.username || '').toLowerCase() === meLower);
+                    ((myRow?.team_members || myRow?.teamMembers || '').toString())
+                        .split(',').map(s => s.trim()).filter(Boolean)
+                        .forEach(m => { if (m !== currentUser.username) memberSet.add(m); });
                 }
 
-                // Build dropdown options
+                // Rebuild options
                 dropdown.innerHTML = '<option value="all">👥 All Members</option>';
-
-                const sortedMembers = Array.from(directReports).sort((a, b) => a.localeCompare(b));
-                sortedMembers.forEach(member => {
-                    const option = document.createElement('option');
-                    option.value = member;
-                    option.textContent = `👤 ${member}`;
-                    dropdown.appendChild(option);
+                Array.from(memberSet).sort((a, b) => a.localeCompare(b)).forEach(member => {
+                    const opt = document.createElement('option');
+                    opt.value = member;
+                    opt.textContent = '👤 ' + member;
+                    dropdown.appendChild(opt);
                 });
 
                 // Restore previous selection if still valid
-                if (currentValue && sortedMembers.includes(currentValue)) {
-                    dropdown.value = currentValue;
-                }
+                if (currentValue !== 'all' && memberSet.has(currentValue)) dropdown.value = currentValue;
             }
 
             function renderListView(todos) {
@@ -23250,14 +23603,6 @@
                     const isDueToday = todo.due_date && new Date(todo.due_date).toDateString() === new Date().toDateString();
                     const isMainAssignee = todo.assigned_to === currentUser?.username;
                     const isChainMember = todo.is_chain_member === true;
-                    const workflowStatus = todo.task_status || (todo.completed ? 'done' : 'todo');
-                    const workflowStatusMap = {
-                        backlog: { label: 'Waiting Ack', bg: '#fff7ed', color: '#c2410c', icon: '📨' },
-                        todo: { label: 'Pending', bg: '#eef2ff', color: '#4338ca', icon: '📝' },
-                        in_progress: { label: 'In Progress', bg: '#ecfccb', color: '#3f6212', icon: '🚀' },
-                        done: { label: 'Done', bg: '#dcfce7', color: '#166534', icon: '✅' }
-                    };
-                    const workflowCfg = workflowStatusMap[workflowStatus] || workflowStatusMap.todo;
 
                     // Parse assignment chain count
                     let chainCount = 0;
@@ -23265,6 +23610,32 @@
                         const chain = todo.assignment_chain ? (typeof todo.assignment_chain === 'string' ? JSON.parse(todo.assignment_chain) : todo.assignment_chain) : [];
                         chainCount = chain.length;
                     } catch (e) {}
+
+                    // Parse multi-assignment data
+                    let maData = null;
+                    try { maData = todo.multi_assignment ? (typeof todo.multi_assignment === 'string' ? JSON.parse(todo.multi_assignment) : todo.multi_assignment) : null; } catch(e) {}
+                    const isMaEnabled = !!(maData?.enabled);
+                    const maMyEntry = isMaEnabled ? (maData.assignees || []).find(a => (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase()) : null;
+                    const maIsCreator = isMaEnabled && (maData.created_by||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+
+                    const workflowStatus = todo.task_status || (todo.completed ? 'done' : 'todo');
+                    const workflowStatusMap = {
+                        backlog: { label: 'Waiting Ack', bg: '#fff7ed', color: '#c2410c', icon: '📨' },
+                        todo: { label: 'Pending', bg: '#eef2ff', color: '#4338ca', icon: '📝' },
+                        in_progress: { label: 'In Progress', bg: '#ecfccb', color: '#3f6212', icon: '🚀' },
+                        done: { label: 'Done', bg: '#dcfce7', color: '#166534', icon: '✅' }
+                    };
+                    // For Multi-Assignment, show the current user's own status
+                    let workflowCfg = workflowStatusMap[workflowStatus] || workflowStatusMap.todo;
+                    if (maMyEntry) {
+                        if (maMyEntry.status === 'completed' || maMyEntry.status === 'accepted') {
+                            workflowCfg = { label: 'Done (My)', bg: '#dcfce7', color: '#166534', icon: '✅' };
+                        } else if (maMyEntry.status === 'in_progress') {
+                            workflowCfg = workflowStatusMap.in_progress;
+                        } else if (maMyEntry.status === 'pending') {
+                            workflowCfg = workflowStatusMap.todo;
+                        }
+                    }
 
                     const isMainTaskCreator = todo.username === currentUser?.username;
                     const canEdit = isMainTaskCreator;
@@ -23302,6 +23673,7 @@
                     ${chainCount > 0 ? `<span style="background: #fdf2f7; color: #9d174d; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700; display: flex; align-items: center; gap: 4px;" title="${chainCount} user(s) in chain">🔗 ${chainCount} Level${chainCount !== 1 ? 's' : ''}</span>` : ''}
                     ${todo.is_shared ? '<span style="background: #e0e7ff; color: #4338ca; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;">👥 Shared</span>' : ''}
                     ${isChainMember ? '<span style="background: #eef2ff; color: #6366f1; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700;">🔗 In Chain</span>' : ''}
+                    ${isMaEnabled ? `<span onclick="openTodoDetail('${todo.id}')" style="background: #cffafe; color: #0e7490; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700; cursor:pointer; border: 1px solid #a5f3fc;" title="Multi-Assignment – ${maData.completion_percentage||0}% complete">👥 ${maData.completion_percentage||0}% · ${(maData.assignees||[]).length} Assignees</span>` : ''}
                     <span style="background: ${workflowCfg.bg}; color: ${workflowCfg.color}; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700;">${workflowCfg.icon} ${workflowCfg.label}</span>
                     ${todo.queue_status === 'queued' ? '<span style="background: #fef3c7; color: #92400e; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700;">📥 Queued</span>' : ''}
                     ${todo.queue_department && !todo.assigned_to ? `<span style="background: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;">🏢 ${escapeHtml(todo.queue_department)}</span>` : ''}
@@ -23311,6 +23683,7 @@
                     </div>
                     
                     ${todo.description ? `<p style="margin: 0 0 8px 0; color: #64748b; font-size: 14px; ${todo.completed ? 'text-decoration: line-through;' : ''}">${escapeHtml(todo.description)}</p>` : ''}
+                    ${renderMultiAssignListPanel(todo, maData, maIsCreator, maMyEntry)}
                     
                     <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap; font-size: 13px; color: #94a3b8;">
                     ${todo.created_at ? `
@@ -23318,12 +23691,13 @@
                         <span style="font-size: 16px;">🆕</span>
                         <span style="font-weight: 700; color: #1E293B;">Created:</span>
                         <span style="color: #475569;">${formatDateTime(todo.created_at)}</span>
-                        ${todo.username && todo.username !== currentUser?.username ? `<span style="color: #64748b; font-weight: 500;">by ${escapeHtml(todo.username)}</span>` : ''}
+                        ${todo.username && todo.username !== currentUser?.username ? `<span style="color: #64748b; font-weight: 500;">by ${escapeHtml(todo.username)}${todo.creator_department ? ` (${escapeHtml(todo.creator_department)})` : ''}</span>` : ''}
                         </span>
                     ` : ''}
                     ${todo.assigned_to ? `
                         <span style="display: flex; align-items: center; gap: 4px; color: #475569; font-weight: 600;">
                         👤 Assigned to: ${escapeHtml(todo.assigned_to)}
+                        ${todo.assignee_department ? `<span style="font-weight: 400; color: #64748b; font-size: 12px;">(${escapeHtml(todo.assignee_department)})</span>` : ''}
                         </span>
                     ` : ''}
                     ${todo.completed && todo.completed_at ? `
@@ -23361,6 +23735,13 @@
 
                 <!-- Actions -->
                 <div style="display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap;">
+                    ${maMyEntry ? (() => {
+                        if (maMyEntry.status === 'pending') return `<button onclick=\"maUpdateMyStatus('${todo.id}', 'in_progress')\" style=\"background: #10b981; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(16,185,129,0.3);\" onmouseover=\"this.style.background='#059669'; this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#10b981'; this.style.transform='scale(1)';\">🚀 Start Task</button>`;
+                        if (maMyEntry.status === 'in_progress') return `<button onclick=\"maUpdateMyStatus('${todo.id}', 'completed')\" style=\"background: #8b5cf6; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(139,92,246,0.3);\" onmouseover=\"this.style.background='#7c3aed'; this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#8b5cf6'; this.style.transform='scale(1)';\">⚡ Take Action</button>`;
+                        if (maMyEntry.status === 'completed') return `<button disabled style=\"background: #e2e8f0; color: #475569; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: not-allowed; font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 6px;\">✅ Submitted</button>`;
+                        if (maMyEntry.status === 'accepted') return `<button disabled style=\"background: #dcfce7; color: #166534; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: not-allowed; font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 6px;\">✅ Completed</button>`;
+                        return '';
+                    })() : ''}
                     ${canPickQueuedTask && !todo.completed ? `<button onclick="claimQueuedTask('${todo.id}')" style="background: #0ea5e9; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(14,165,233,0.3);" onmouseover="this.style.background='#0284c7'; this.style.transform='scale(1.02)';" onmouseout="this.style.background='#0ea5e9'; this.style.transform='scale(1)';">📥 Pick</button>` : ''}
                     ${isMainAssignee && !todo.completed && workflowStatus === 'backlog' && todo.approval_status !== 'pending_approval' ? `<button onclick="acknowledgeTaskAssignment('${todo.id}')" style="background: #f59e0b; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(245,158,11,0.3);" onmouseover="this.style.background='#d97706'; this.style.transform='scale(1.02)';" onmouseout="this.style.background='#f59e0b'; this.style.transform='scale(1)';">✅ Acknowledge</button>` : ''}
                     ${isMainAssignee && !todo.completed && (workflowStatus === 'backlog' || workflowStatus === 'todo') && todo.approval_status !== 'pending_approval' ? `<button onclick="startTaskWork('${todo.id}')" style="background: #10b981; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(16,185,129,0.3);" onmouseover="this.style.background='#059669'; this.style.transform='scale(1.02)';" onmouseout="this.style.background='#10b981'; this.style.transform='scale(1)';">🚀 Start Task</button>` : ''}
@@ -23456,6 +23837,53 @@
                         initKanbanDragAndDrop();
                     }, 100);
                 }
+            }
+
+            // Render compact multi-assignment panel inside list items (visible without opening task)
+            function renderMultiAssignListPanel(todo, maData, maIsCreator, maMyEntry) {
+                if (!maData || !maData.enabled) return '';
+
+                const pct = maData.completion_percentage || 0;
+                const assignees = maData.assignees || [];
+                const statusColors = { pending:'#94a3b8', in_progress:'#06b6d4', completed:'#8b5cf6', accepted:'#10b981', rejected:'#ef4444' };
+                const statusLabels = { pending:'⏳ Pending', in_progress:'🚀 In Progress', completed:'✅ Done (review)', accepted:'🎉 Accepted', rejected:'❌ Rejected' };
+
+                const rows = assignees.map(a => {
+                    const isMe = (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+                    const sColor = statusColors[a.status] || '#94a3b8';
+                    const sLabel = statusLabels[a.status] || a.status;
+                    const actionBtns = maIsCreator && !isMe && a.status === 'completed'
+                        ? `<button onclick="maAcceptAssignee('${todo.id}','${a.username}')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;margin-right:4px;">✅ Accept</button>
+                           <button onclick="maRejectAssignee('${todo.id}','${a.username}')" style="background:#ef4444;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">❌ Reject</button>`
+                        : maIsCreator && !isMe && a.status === 'accepted'
+                            ? `<button onclick="maReopenAssignee('${todo.id}','${a.username}')" style="background:#f59e0b;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">🔓 Reopen</button>`
+                        : isMe && a.status === 'pending'
+                            ? `<button onclick="maUpdateMyStatus('${todo.id}','in_progress')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">🚀 Start Task</button>`
+                        : isMe && a.status === 'in_progress'
+                            ? `<button onclick="maUpdateMyStatus('${todo.id}','completed')" style="background:#8b5cf6;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">⚡ Take Action</button>`
+                        : '';
+                    const feedbackNote = a.notes ? `<div style="width:100%;margin-top:6px;padding:8px 10px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:6px;font-size:11px;color:#78350f;line-height:1.4;"><strong>💬 Feedback:</strong> ${escapeHtml(a.notes)}</div>` : '';
+                    return `<div style="width:100%;display:flex;flex-direction:column;padding:8px 12px;border-radius:10px;background:${isMe?'#f0fdff':'#f8fafc'};border:1px solid ${isMe?'#a5f3fc':'#e2e8f0'};margin-bottom:6px;">
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <span style="font-weight:700;font-size:12px;color:#1e293b;min-width:120px;">${escapeHtml(a.username)}${isMe?' (you)':''}</span>
+                            <span style="font-size:11px;font-weight:700;color:${sColor};background:${sColor}15;padding:3px 10px;border-radius:20px;">${sLabel}</span>
+                            <div style="margin-left:auto;display:flex;gap:4px;">${actionBtns}</div>
+                        </div>
+                        ${feedbackNote}
+                    </div>`;
+                }).join('');
+
+                return `<div style="margin: 10px 0 14px 0; padding: 12px 14px; background: linear-gradient(135deg,#ecfeff 0%,#cffafe 100%); border: 1px solid #a5f3fc; border-radius: 14px;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+                        <span style="font-size:16px;">👥</span>
+                        <strong style="color:#0e7490;font-size:13px;">Multi-Assignment Progress</strong>
+                        <span style="margin-left:auto;font-size:12px;font-weight:700;color:#0e7490;">${pct}% Complete · ${assignees.length} Assignee${assignees.length!==1?'s':''}</span>
+                    </div>
+                    <div style="background:#e0f2fe;border-radius:99px;height:8px;overflow:hidden;margin-bottom:10px;">
+                        <div style="height:100%;background:linear-gradient(90deg,#06b6d4,#0891b2);border-radius:99px;width:${pct}%;transition:width 0.4s;"></div>
+                    </div>
+                    ${rows}
+                </div>`;
             }
 
             function createKanbanCard(todo) {
@@ -23827,11 +24255,19 @@
                 // Completed by (even if later reassigned)
                 if ((task.completed_by || '').toLowerCase() === uLower) return true;
                 // In the assignment chain (passed through this user)
-
                 if (task.is_chain_member === true) return true;
                 if (task.is_completed_by_me === true) return true;
                 if (task.is_assigned_to_me === true) return true;
                 if (task.is_shared === true) return true;
+                // Multi-assignment task
+                if (task.is_multi_assigned === true) return true;
+                try {
+                    const ma = task.multi_assignment
+                        ? (typeof task.multi_assignment === 'string' ? JSON.parse(task.multi_assignment) : task.multi_assignment)
+                        : null;
+                    if (ma?.enabled && Array.isArray(ma.assignees) &&
+                        ma.assignees.some(a => (a.username || '').toLowerCase() === uLower)) return true;
+                } catch(e) { /* ignore */ }
                 // Check assignment_chain array directly
                 try {
                     const chain = task.assignment_chain
@@ -23863,7 +24299,11 @@
                 const qfManagerVisible = document.getElementById('todoManagerFiltersGroup')?.style.display !== 'none';
                 const qfUser = (qfManagerVisible && qfTeamMemberFilter !== 'all') ? qfTeamMemberFilter : me;
 
-                if (activeQuickFilter && activeQuickFilter !== 'all') {
+                // When a specific team member is selected, skip quick-filter restrictions
+                // so ALL their tasks are shown (not just "my pending" etc.)
+                const memberSelected = qfManagerVisible && qfTeamMemberFilter !== 'all';
+
+                if (!memberSelected && activeQuickFilter && activeQuickFilter !== 'all') {
                     if (activeQuickFilter === 'my_pending') {
                         // My Pending = tasks assigned to me (or self-created without assignee) that are NOT completed
                         // Also includes queued department tasks available for me to pick up
@@ -23873,6 +24313,15 @@
                             // Directly assigned or self-created
                             if ((t.assigned_to || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
                             if (!t.assigned_to && (t.username || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
+                            // Multi-assignment: show if I'm an assignee and not yet accepted
+                            try {
+                                const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                                if (ma?.enabled && Array.isArray(ma.assignees)) {
+                                    const me = (qfUser || '').toLowerCase();
+                                    const entry = ma.assignees.find(a => (a.username || '').toLowerCase() === me);
+                                    if (entry && entry.status !== 'accepted') return true;
+                                }
+                            } catch(e) { /* ignore */ }
                             // Queued department tasks the user can pick up
                             if (t.queue_status === 'queued' && myDept && (t.queue_department || '').toLowerCase().trim() === myDept) return true;
                             return false;
@@ -23881,8 +24330,17 @@
                         // My All Tasks = ALL tasks assigned to me (completed or not, but not archived)
                         todos = todos.filter(t => {
                             if (t.archived) return false;
-                            return (t.assigned_to || '').toLowerCase() === (qfUser || '').toLowerCase() ||
-                                   (!t.assigned_to && (t.username || '').toLowerCase() === (qfUser || '').toLowerCase());
+                            if ((t.assigned_to || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
+                            if (!t.assigned_to && (t.username || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
+                            // Multi-assignment
+                            try {
+                                const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                                if (ma?.enabled && Array.isArray(ma.assignees)) {
+                                    const me = (qfUser || '').toLowerCase();
+                                    return ma.assignees.some(a => (a.username || '').toLowerCase() === me);
+                                }
+                            } catch(e) { /* ignore */ }
+                            return false;
                         });
                     } else if (activeQuickFilter === 'team_pending') {
                         // Your Assigned Pending = tasks I CREATED and assigned to someone else, not completed
@@ -23966,7 +24424,30 @@
                     if (status === 'queue') { if (!isQueuedForMyDept) return false; }
                     else if (status === 'pending' && (t.completed || t.task_status === 'in_progress') && !isQueuedForMyDept) return false;
                     else if (status === 'inprogress' && (t.completed || t.task_status !== 'in_progress')) return false;
-                    else if (status === 'completed' && !t.completed) return false;
+                    else if (status === 'completed') {
+                        if (t.completed) {
+                            // Task is completed globally
+                        } else {
+                            // Check if it's a multi-assignment task where ANY assignee completed their portion
+                            let isMultiAssignmentCompleted = false;
+                            try {
+                                const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                                if (ma?.enabled && Array.isArray(ma.assignees)) {
+                                    const me = (currentUser?.username || '').toLowerCase();
+                                    // Check if ANY assignee has accepted/completed their portion
+                                    const anyAssigneeCompleted = ma.assignees.some(a => a.status === 'accepted' || a.status === 'completed');
+                                    // Check if current user is involved (creator or assignee)
+                                    const isCreator = (t.username || '').toLowerCase() === me;
+                                    const isAssignee = ma.assignees.some(a => (a.username || '').toLowerCase() === me);
+                                    // Show as completed to ALL linked users if ANY assignee completed
+                                    if (anyAssigneeCompleted && (isCreator || isAssignee)) {
+                                        isMultiAssignmentCompleted = true;
+                                    }
+                                }
+                            } catch(e) { /* ignore */ }
+                            if (!isMultiAssignmentCompleted) return false;
+                        }
+                    }
                     else if (status === 'overdue' && (t.completed || !t.due_date || new Date(t.due_date) >= now)) return false;
 
                     // Priority filter
@@ -23977,15 +24458,17 @@
                     // Scope / Team Member filter
                     const managerFiltersVisible = document.getElementById('todoManagerFiltersGroup')?.style.display !== 'none';
                     const teamMemberFilter = document.getElementById('todoFilterTeamMember')?.value || 'all';
+                    const isAdminOrSMFilter = currentUser && (currentUser.username === 'admin' || currentUser.role === 'Super Manager' || currentUser.role === 'Admin');
 
                     if (currentUser && managerFiltersVisible) {
                         if (teamMemberFilter !== 'all') {
                             // A specific member is selected → show ALL tasks for that member (bypass "mine" restriction)
                             if (!isUserInvolved(t, teamMemberFilter)) return false;
-                        } else {
-                            // No member selected → default: show only tasks where I'm involved OR queued for my dept
+                        } else if (!isAdminOrSMFilter) {
+                            // No member selected & not admin/super → show only tasks where I'm involved OR queued for my dept
                             if (!isUserInvolved(t, currentUser.username) && !isQueuedForMyDept) return false;
                         }
+                        // Admin/Super Manager with 'All Members' → no restriction, show every task
                     }
 
                     // Archived filter
@@ -24204,6 +24687,15 @@
                     if (t.completed || t.archived) return false;
                     if ((t.assigned_to || '').toLowerCase() === (countUser || '').toLowerCase()) return true;
                     if (!t.assigned_to && (t.username || '').toLowerCase() === (countUser || '').toLowerCase()) return true;
+                    // Multi-assignment: include if I'm an assignee and not yet accepted
+                    try {
+                        const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                        if (ma?.enabled && Array.isArray(ma.assignees)) {
+                            const userLower = (countUser || '').toLowerCase();
+                            const entry = ma.assignees.find(a => (a.username || '').toLowerCase() === userLower);
+                            if (entry && entry.status !== 'accepted' && entry.status !== 'completed') return true;
+                        }
+                    } catch(e) { /* ignore */ }
                     // Queued department tasks the user can pick up
                     if (t.queue_status === 'queued' && myDeptLower && (t.queue_department || '').toLowerCase().trim() === myDeptLower) return true;
                     return false;
@@ -24212,8 +24704,17 @@
                 // My All Tasks: all tasks assigned to me (completed or not, not archived)
                 const myAllTasks = contextTodos.filter(t => {
                     if (t.archived) return false;
-                    return (t.assigned_to || '').toLowerCase() === (countUser || '').toLowerCase() ||
-                           (!t.assigned_to && (t.username || '').toLowerCase() === (countUser || '').toLowerCase());
+                    if ((t.assigned_to || '').toLowerCase() === (countUser || '').toLowerCase()) return true;
+                    if (!t.assigned_to && (t.username || '').toLowerCase() === (countUser || '').toLowerCase()) return true;
+                    // Multi-assignment: include all tasks where I'm an assignee (any status)
+                    try {
+                        const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                        if (ma?.enabled && Array.isArray(ma.assignees)) {
+                            const userLower = (countUser || '').toLowerCase();
+                            return ma.assignees.some(a => (a.username || '').toLowerCase() === userLower);
+                        }
+                    } catch(e) { /* ignore */ }
+                    return false;
                 });
 
                 // Your Assigned Pending: tasks I CREATED and assigned to someone else, not completed
@@ -24419,16 +24920,27 @@
 
                 // Reset routing cards
                 currentRoutingSelection = null;
-                ['Self', 'Dept', 'Manager'].forEach(key => {
+                ['Self', 'Dept', 'Manager', 'Multi'].forEach(key => {
                     const card = document.getElementById('routeCard' + key);
                     const check = document.getElementById('routeCheck' + key);
                     if (card) { card.style.borderColor = '#e2e8f0'; card.style.background = 'white'; card.classList.remove('route-selected'); }
                     if (check) { check.style.borderColor = '#d1d5db'; check.style.background = 'transparent'; check.innerHTML = ''; }
                 });
 
-                // Show self toggle section (only for new tasks)
+                // Show self toggle section (only for new tasks) and reset label
                 const selfToggleSection = document.getElementById('todoSelfToggleSection');
-                if (selfToggleSection) selfToggleSection.style.display = 'block';
+                if (selfToggleSection) {
+                    selfToggleSection.style.display = 'block';
+                    const routingLabel = selfToggleSection.querySelector('label');
+                    if (routingLabel) routingLabel.innerHTML = '\ud83d\ude80 Task Routing';
+                }
+
+                // Reset multi routing
+                window._maSelected = new Set();
+                const multiDetails = document.getElementById('todoMultiRoutingDetails');
+                const multiRadio = document.getElementById('todoRouteMulti');
+                if (multiDetails) multiDetails.style.display = 'none';
+                if (multiRadio) multiRadio.checked = false;
 
                 // Reset radio buttons and hide detail panels
                 const deptRadio = document.getElementById('todoRouteDept');
@@ -24562,7 +25074,7 @@
             }
 
             // Current routing selection state
-            let currentRoutingSelection = null; // 'self', 'department', 'manager'
+            let currentRoutingSelection = null; // 'self', 'department', 'manager', 'multi'
             let lastDepartmentSelection = '';
 
             // Card-based routing selection (replaces old toggleSelfTodo + toggleRoutingOption)
@@ -24570,18 +25082,22 @@
                 const cards = {
                     self: document.getElementById('routeCardSelf'),
                     department: document.getElementById('routeCardDept'),
-                    manager: document.getElementById('routeCardManager')
+                    manager: document.getElementById('routeCardManager'),
+                    multi: document.getElementById('routeCardMulti')
                 };
                 const checks = {
                     self: document.getElementById('routeCheckSelf'),
                     department: document.getElementById('routeCheckDept'),
-                    manager: document.getElementById('routeCheckManager')
+                    manager: document.getElementById('routeCheckManager'),
+                    multi: document.getElementById('routeCheckMulti')
                 };
                 const deptDetails = document.getElementById('todoDeptRoutingDetails');
                 const mgrDetails = document.getElementById('todoManagerRoutingDetails');
+                const multiDetails = document.getElementById('todoMultiRoutingDetails');
                 const selfTodoCheck = document.getElementById('todoSelfTodo');
                 const deptRadio = document.getElementById('todoRouteDept');
                 const mgrRadio = document.getElementById('todoRouteManager');
+                const multiRadio = document.getElementById('todoRouteMulti');
                 const deptSelect = document.getElementById('todoCategory');
                 const mgrSelect = document.getElementById('todoDirectManager');
                 const deptSection = document.getElementById('todoDepartmentSection');
@@ -24594,13 +25110,23 @@
                     Object.values(checks).forEach(c => { if(c) { c.style.borderColor = '#d1d5db'; c.style.background = 'transparent'; c.innerHTML = ''; }});
                     if (deptDetails) deptDetails.style.display = 'none';
                     if (mgrDetails) mgrDetails.style.display = 'none';
+                    if (multiDetails) multiDetails.style.display = 'none';
                     if (selfTodoCheck) selfTodoCheck.checked = false;
                     if (deptRadio) deptRadio.checked = false;
                     if (mgrRadio) mgrRadio.checked = false;
+                    if (multiRadio) multiRadio.checked = false;
+                    window._maSelected = new Set();
 
                     // When nothing is selected, keep Department dropdown hidden
                     if (deptSection) deptSection.style.display = 'none';
                     return;
+                }
+
+                // Clear multi selection when switching away from multi
+                if (currentRoutingSelection === 'multi' && type !== 'multi') {
+                    window._maSelected = new Set();
+                    const cnt = document.getElementById('maSelectedCount');
+                    if (cnt) cnt.textContent = '0 selected';
                 }
 
                 currentRoutingSelection = type;
@@ -24609,7 +25135,8 @@
                 const colors = {
                     self: { border: '#f59e0b', bg: '#fffbeb', checkBg: '#f59e0b' },
                     department: { border: '#10b981', bg: '#f0fdf4', checkBg: '#10b981' },
-                    manager: { border: '#8b5cf6', bg: '#f5f3ff', checkBg: '#8b5cf6' }
+                    manager: { border: '#8b5cf6', bg: '#f5f3ff', checkBg: '#8b5cf6' },
+                    multi: { border: '#06b6d4', bg: '#ecfeff', checkBg: '#06b6d4' }
                 };
 
                 // Reset all cards
@@ -24638,19 +25165,23 @@
                 if (selfTodoCheck) selfTodoCheck.checked = (type === 'self');
                 if (deptRadio) deptRadio.checked = (type === 'department');
                 if (mgrRadio) mgrRadio.checked = (type === 'manager');
+                if (multiRadio) multiRadio.checked = (type === 'multi');
 
                 // Show/hide detail panels
                 if (deptDetails) deptDetails.style.display = (type === 'department') ? 'block' : 'none';
                 if (mgrDetails) mgrDetails.style.display = (type === 'manager') ? 'block' : 'none';
+                if (multiDetails) multiDetails.style.display = (type === 'multi') ? 'block' : 'none';
 
                 // Load managers when manager routing is selected
-                if (type === 'manager') {
-                    loadManagersForTodoModal();
+                if (type === 'manager') { loadManagersForTodoModal(); }
+
+                // Load users when multi routing is selected
+                if (type === 'multi') {
+                    window._maSelected = window._maSelected || new Set();
+                    maLoadUsers();
                 }
 
-                // Department dropdown visibility rules:
-                // - If routing to department: show Department dropdown
-                // - If routing to self/manager: hide Department dropdown (as requested)
+                // Department dropdown visibility rules
                 if (type === 'department') {
                     if (deptSection) deptSection.style.display = 'block';
                     if (deptSelect && !deptSelect.value && lastDepartmentSelection) {
@@ -24727,6 +25258,14 @@
                     modal.style.display = 'none';
                     modal.classList.remove('active');
                 }
+                // Reset routing label back to default for next open
+                const selfToggleSection = document.getElementById('todoSelfToggleSection');
+                if (selfToggleSection) {
+                    const routingLabel = selfToggleSection.querySelector('label');
+                    if (routingLabel) routingLabel.innerHTML = '\ud83d\ude80 Task Routing';
+                }
+                // Clear multi-assignment selection
+                window._maSelected = new Set();
                 // Reset save button so it's not stuck on "Saving..." when modal reopens
                 const btn = document.querySelector('#todoForm button[type="submit"]');
                 if (btn) {
@@ -24752,12 +25291,31 @@
                     return;
                 }
 
+                // Fetch fresh data to ensure we get all current fields
+                const token = authToken;
+                if (!token) return;
+                try {
+                    const todoDetails = await directAPI.getTodoDetails(todoId, token);
+                    if (!todoDetails) {
+                        showToast('Failed to load task details', 'error');
+                        return;
+                    }
+                    // Merge fresh details with todo to ensure all fields are current
+                    Object.assign(todo, todoDetails);
+                } catch(e) {
+                    console.warn('Could not fetch fresh task details, using cache:', e);
+                }
+
                 const titleText = document.getElementById('todoModalTitleText');
                 if (titleText) titleText.textContent = 'Edit Task';
 
-                // Hide self-todo toggle and routing section when editing (task already routed)
+                // Show routing section so creator can update routing/assignees during edit
                 const selfToggleSection = document.getElementById('todoSelfToggleSection');
-                if (selfToggleSection) selfToggleSection.style.display = 'none';
+                if (selfToggleSection) {
+                    selfToggleSection.style.display = 'block';
+                    const routingLabel = selfToggleSection.querySelector('label');
+                    if (routingLabel) routingLabel.innerHTML = '✏️ Update Task Routing / Assignees';
+                }
 
                 // Keep Department dropdown hidden during editing (removed from UI)
                 const deptSection = document.getElementById('todoDepartmentSection');
@@ -24831,6 +25389,30 @@
                     modal.classList.add('active');
                 }
 
+                // Pre-select routing state based on the existing task
+                setTimeout(() => {
+                    const existingMA = (() => { try { return todo.multi_assignment ? (typeof todo.multi_assignment === 'string' ? JSON.parse(todo.multi_assignment) : todo.multi_assignment) : null; } catch(e) { return null; } })();
+                    if (existingMA && existingMA.enabled) {
+                        // Pre-populate multi-assignment assignees
+                        window._maSelected = new Set((existingMA.assignees || []).map(a => a.username).filter(Boolean));
+                        selectRouting('multi');
+                    } else if (todo.assigned_to && todo.manager_id) {
+                        selectRouting('manager');
+                        const mgr = document.getElementById('todoDirectManager');
+                        if (mgr && todo.assigned_to) {
+                            // Add option if not present
+                            let found = false;
+                            for (let i = 0; i < mgr.options.length; i++) { if (mgr.options[i].value === todo.assigned_to) { found = true; break; } }
+                            if (!found) { const opt = document.createElement('option'); opt.value = todo.assigned_to; opt.textContent = todo.assigned_to; mgr.appendChild(opt); }
+                            mgr.value = todo.assigned_to;
+                        }
+                    } else if (todo.queue_department) {
+                        selectRouting('department');
+                    } else {
+                        selectRouting('self');
+                    }
+                }, 150);
+
                 startTodoDraftAutosave('edit', todoId);
                 setTimeout(() => maybeRestoreTodoDraft('edit', todoId), 500);
             }
@@ -24848,6 +25430,8 @@
                 const selectedManager = document.getElementById('todoDirectManager')?.value || '';
                 const routeDept = document.getElementById('todoRouteDept')?.checked || false;
                 const routeManager = document.getElementById('todoRouteManager')?.checked || false;
+                const routeMulti = document.getElementById('todoRouteMulti')?.checked || false;
+                const selectedMultiAssignees = routeMulti ? Array.from(window._maSelected || new Set()) : [];
 
                 const todoData = {
                     id: todoId || undefined,
@@ -24873,10 +25457,14 @@
                     todoData.package_name = 'Others';
                 }
 
-                // Validate routing: must choose self, department, or manager (for new tasks only)
+                // Validate routing: must choose self, department, manager, or multi (for new tasks only)
                 if (!todoId && !isSelfTodo) {
-                    if (!routeDept && !routeManager) {
-                        showToast('Please select a routing option: Self Todo, Send to Department, or Send to Manager.', 'error');
+                    if (!routeDept && !routeManager && !routeMulti) {
+                        showToast('Please select a routing option: Self Todo, Department, Manager, or Multi-Assignment.', 'error');
+                        return;
+                    }
+                    if (routeMulti && selectedMultiAssignees.length === 0) {
+                        showToast('Please select at least one user for multi-assignment.', 'error');
                         return;
                     }
                     if (routeDept && !selectedDepartment) {
@@ -24950,6 +25538,62 @@
                             console.warn('Queue routing error (task still saved):', qErr);
                             showToast(isNewTask ? 'Task created! (queue routing pending)' : 'Task updated!', 'success');
                         }
+                    } else if (routeMulti && taskId) {
+                        // Multi-assignment: persist JSONB (create or update)
+                        const _maNow = new Date().toISOString();
+                        // Preserve existing assignee statuses if editing
+                        let existingMAData = null;
+                        if (todoId) {
+                            const existingTodo = (todosCache?.data || []).find(t => t.id === taskId);
+                            if (existingTodo?.multi_assignment) {
+                                try { existingMAData = typeof existingTodo.multi_assignment === 'string' ? JSON.parse(existingTodo.multi_assignment) : existingTodo.multi_assignment; } catch(e) {}
+                            }
+                        }
+                        const existingMap = {};
+                        (existingMAData?.assignees || []).forEach(a => { if (a.username) existingMap[a.username] = a; });
+
+                        const assigneesToSave = selectedMultiAssignees.length > 0 ? selectedMultiAssignees : [];
+                        const _maData = {
+                            enabled: assigneesToSave.length > 0,
+                            created_by: currentUser?.username,
+                            assignees: assigneesToSave.map(uname =>
+                                existingMap[uname] || { username: uname, status: 'pending', assigned_at: _maNow, completed_at: null, accepted_at: null, accepted_by: null, rejection_reason: null, notes: null }
+                            )
+                        };
+                        const completedCount = _maData.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                        _maData.completion_percentage = _maData.assignees.length > 0 ? Math.round((completedCount / _maData.assignees.length) * 100) : 0;
+                        _maData.all_completed = _maData.assignees.length > 0 && _maData.assignees.every(a => ['completed','accepted'].includes(a.status));
+
+                        try {
+                            // Ensure _maData is properly serialized for Supabase JSONB column
+                            // IMPORTANT: Save multi-assignment data BEFORE sending notifications
+                            await getSupabase().from('todos').update({ 
+                                multi_assignment: _maData  // Supabase will auto-convert object to JSONB
+                            }).eq('id', taskId);
+                            console.log('✅ Multi-assignment data saved for task', taskId, _maData);
+                        } catch(maErr) { 
+                            console.error('❌ multi_assignment save failed:', maErr);
+                            showToast('Warning: Multi-assignment routing may have failed. Task saved but assignment may not have been recorded.', 'warning');
+                        }
+
+                        // Only notify newly added assignees (AFTER successfully saving MA data)
+                        const newAssignees = assigneesToSave.filter(u => !existingMap[u]);
+                        for (const uname of newAssignees) {
+                            try {
+                                await directAPI.createNotification({
+                                    userId: uname, type: 'task_assigned',
+                                    title: '👥 Multi-Assignment Task',
+                                    message: `${currentUser?.username} assigned "${todoData.title}" to you and ${assigneesToSave.length - 1} other(s).`,
+                                    link: `todo:${taskId}`, createdBy: currentUser?.username,
+                                    metadata: { todoId: taskId, multiAssignment: true }
+                                });
+                            } catch(notifErr) {
+                                console.warn('Notification failed for', uname, notifErr);
+                            }
+                        }
+                        window._maSelected = new Set();
+                        const actionWord = todoId ? 'Updated' : 'Assigned';
+                        showToast(`✅ ${actionWord}! Task sent to ${assigneesToSave.length} user${assigneesToSave.length !== 1 ? 's' : ''}.`, 'success');
                     } else {
                         showToast(isNewTask ? 'Task created!' : 'Task updated!', 'success');
                     }
@@ -25896,6 +26540,8 @@
                             </div>
                             ` : ''}
 
+                            ${renderMultiAssignPanel(details)}
+
                             <!-- Action Buttons - Only visible to task creator -->
                             ${details.username === currentUser?.username ? `
                             <div
@@ -26041,6 +26687,54 @@
                 }
             }
 
+            // Multi-Assignment Submission Feedback Modal Functions
+            function closeMaSubmissionFeedbackModal() {
+                const modal = document.getElementById('maSubmissionFeedbackModal');
+                if (modal) modal.style.display = 'none';
+                window._maPendingSubmissionTodoId = null;
+                document.getElementById('maSubmissionFeedback').value = '';
+            }
+
+            async function confirmMaSubmissionFeedback() {
+                const todoId = window._maPendingSubmissionTodoId;
+                const feedback = document.getElementById('maSubmissionFeedback').value.trim();
+                const errorEl = document.getElementById('maSubmissionFeedbackError');
+
+                if (!feedback) {
+                    errorEl.style.display = 'block';
+                    document.getElementById('maSubmissionFeedback').focus();
+                    return;
+                }
+
+                closeMaSubmissionFeedbackModal();
+                await maUpdateMyStatusDirect(todoId, 'completed', feedback);
+            }
+
+            // Multi-Assignment Reopen Feedback Modal Functions
+            function closeMaReopenFeedbackModal() {
+                const modal = document.getElementById('maReopenFeedbackModal');
+                if (modal) modal.style.display = 'none';
+                window._maPendingReopenTodoId = null;
+                window._maPendingReopenAssignee = null;
+                document.getElementById('maReopenFeedback').value = '';
+            }
+
+            async function confirmMaReopenFeedback() {
+                const todoId = window._maPendingReopenTodoId;
+                const assigneeUsername = window._maPendingReopenAssignee;
+                const feedback = document.getElementById('maReopenFeedback').value.trim();
+                const errorEl = document.getElementById('maReopenFeedbackError');
+
+                if (!feedback) {
+                    errorEl.style.display = 'block';
+                    document.getElementById('maReopenFeedback').focus();
+                    return;
+                }
+
+                closeMaReopenFeedbackModal();
+                await maReopenAssigneeDirect(todoId, assigneeUsername, feedback);
+            }
+
             // Expose modal functions globally
             window.showCompleteTaskConfirm = showCompleteTaskConfirm;
             window.closeCompleteTaskModal = closeCompleteTaskModal;
@@ -26048,6 +26742,10 @@
             window.showDeclineTaskConfirm = showDeclineTaskConfirm;
             window.closeDeclineTaskModal = closeDeclineTaskModal;
             window.confirmDeclineTask = confirmDeclineTask;
+            window.closeMaSubmissionFeedbackModal = closeMaSubmissionFeedbackModal;
+            window.confirmMaSubmissionFeedback = confirmMaSubmissionFeedback;
+            window.closeMaReopenFeedbackModal = closeMaReopenFeedbackModal;
+            window.confirmMaReopenFeedback = confirmMaReopenFeedback;
 
             async function approveTodoCompletion(todoId) {
                 const token = authToken;
@@ -26210,7 +26908,7 @@
                             ${statusBadge}
                         </div>
                         ${entry.feedback ? `<div style="padding: 10px; background: white; border-radius: 6px; border: 1px solid #e2e8f0; font-size: 13px; color: #475569;">
-                            ${isQuestion ? '❓' : '💬'} <em>${escapeHtml(entry.feedback)}</em>
+                            ${isQuestion ? '❓' : '💬'} <strong>${escapeHtml(entry.user || 'Unknown')}</strong>: <em>${escapeHtml(entry.feedback)}</em>
                         </div>` : ''}
                         ${entry.next_user ? `<div style="font-size: 12px; color: #64748b;">➡️ Next: <strong>${escapeHtml(entry.next_user)}</strong></div>` : ''}
                         ${entry.to && isQuestion ? `<div style="font-size: 12px; color: #f97316;">📩 Asked to: <strong>${escapeHtml(entry.to)}</strong></div>` : ''}
@@ -26603,7 +27301,7 @@
                                         ` : ''}
                                     </div>
                                     ${entry.feedback ? `<div style="padding: 8px 12px; background: white; border-radius: 6px; border: 1px solid #e2e8f0; font-size: 13px; color: #475569; margin-bottom: 6px;">
-                                        💬 ${escapeHtml(entry.feedback)}
+                                        💬 <strong>${escapeHtml(entry.user || 'Unknown')}</strong>: ${escapeHtml(entry.feedback)}
                                     </div>` : ''}
                                     ${isDeclined && entry.decline_reason ? `<div style="font-size: 12px; color: #ef4444; font-style: italic;">Reason: ${escapeHtml(entry.decline_reason)}</div>` : ''}
                                     <div style="font-size: 11px; color: #94a3b8;">${entry.timestamp ? new Date(entry.timestamp).toLocaleString() : ''}</div>
@@ -29566,6 +30264,703 @@
                 }
             }
 
+        </script>
+
+        <!-- ============================================================
+             TEAM MEMBER PROFILE DRAWER
+        ============================================================ -->
+        <div id="mdrOverlay"
+             style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.45);z-index:9000;backdrop-filter:blur(3px);"
+             onclick="closeMemberDrawer()"></div>
+
+        <div id="mdrPanel"
+             style="display:none;position:fixed;top:0;right:0;height:100%;width:min(560px,100vw);
+                    background:#f8fafc;z-index:9001;box-shadow:-8px 0 48px rgba(0,0,0,0.18);
+                    flex-direction:column;overflow:hidden;
+                    transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1);">
+
+            <!-- Gradient Header -->
+            <div style="background:linear-gradient(135deg,#6366F1 0%,#4F46E5 100%);padding:20px 20px 14px;flex-shrink:0;">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <div id="mdrAvatar"
+                             style="width:52px;height:52px;border-radius:50%;background:rgba(255,255,255,0.22);color:#fff;
+                                    display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;
+                                    box-shadow:0 4px 14px rgba(0,0,0,0.2);flex-shrink:0;">?</div>
+                        <div>
+                            <div id="mdrUsername" style="font-size:19px;font-weight:800;color:#fff;line-height:1.1;"></div>
+                            <div style="display:flex;gap:5px;margin-top:4px;flex-wrap:wrap;">
+                                <span id="mdrRole"
+                                      style="font-size:11px;padding:2px 8px;border-radius:5px;
+                                             background:rgba(255,255,255,0.2);color:#fff;font-weight:700;"></span>
+                                <span id="mdrDept"
+                                      style="font-size:11px;padding:2px 8px;border-radius:5px;
+                                             background:rgba(255,255,255,0.13);color:rgba(255,255,255,0.9);font-weight:600;"></span>
+                            </div>
+                            <!-- Skills container -->
+                            <div id="mdrSkills" style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;"></div>
+                            <div id="mdrMeta" style="font-size:11px;color:rgba(255,255,255,0.65);margin-top:4px;"></div>
+                        </div>
+                    </div>
+                    <button onclick="closeMemberDrawer()"
+                            style="background:rgba(255,255,255,0.15);border:none;color:#fff;width:30px;height:30px;
+                                   border-radius:50%;cursor:pointer;font-size:16px;line-height:1;
+                                   display:flex;align-items:center;justify-content:center;flex-shrink:0;">&times;</button>
+                </div>
+                <!-- Live KPI bar -->
+                <div id="mdrKpi" style="display:grid;grid-template-columns:repeat(6,1fr);gap:4px;"></div>
+            </div>
+
+            <!-- Status tabs -->
+            <div style="display:flex;background:#fff;border-bottom:2px solid #e2e8f0;flex-shrink:0;">
+                <button id="mdrTabAll"      onclick="mdrSetTab('all')"
+                        style="flex:1;padding:10px 4px;border:none;background:none;font-size:12px;font-weight:700;
+                               color:#6366F1;border-bottom:3px solid #6366F1;cursor:pointer;">📋 All</button>
+                <button id="mdrTabPending"  onclick="mdrSetTab('pending')"
+                        style="flex:1;padding:10px 4px;border:none;background:none;font-size:12px;font-weight:600;
+                               color:#64748b;border-bottom:3px solid transparent;cursor:pointer;">⏳ Pending</button>
+                <button id="mdrTabProgress" onclick="mdrSetTab('progress')"
+                        style="flex:1;padding:10px 4px;border:none;background:none;font-size:12px;font-weight:600;
+                               color:#64748b;border-bottom:3px solid transparent;cursor:pointer;">🚀 Active</button>
+                <button id="mdrTabDone"     onclick="mdrSetTab('done')"
+                        style="flex:1;padding:10px 4px;border:none;background:none;font-size:12px;font-weight:600;
+                               color:#64748b;border-bottom:3px solid transparent;cursor:pointer;">✅ Done</button>
+                <button id="mdrTabOverdue"  onclick="mdrSetTab('overdue')"
+                        style="flex:1;padding:10px 4px;border:none;background:none;font-size:12px;font-weight:600;
+                               color:#64748b;border-bottom:3px solid transparent;cursor:pointer;">🔴 Overdue</button>
+            </div>
+
+            <!-- Scrollable todo list -->
+            <div id="mdrBody" style="flex:1;overflow-y:auto;padding:16px;"></div>
+
+            <!-- Footer -->
+            <div style="padding:12px 16px;background:#fff;border-top:1px solid #e2e8f0;flex-shrink:0;display:flex;gap:8px;">
+                <button onclick="mdrGoToFullList()"
+                        style="flex:1;padding:9px;background:linear-gradient(135deg,#6366F1,#4F46E5);
+                               color:#fff;border:none;border-radius:9px;font-weight:700;font-size:13px;cursor:pointer;">
+                    🔍 View Full Task List
+                </button>
+                <button onclick="closeMemberDrawer()"
+                        style="padding:9px 14px;background:#f1f5f9;color:#334155;
+                               border:none;border-radius:9px;font-weight:700;font-size:13px;cursor:pointer;">Close</button>
+            </div>
+        </div>
+
+        <script>
+        // ================================================================
+        // TEAM MEMBER PROFILE DRAWER
+        // ================================================================
+        let _mdrUser = null;
+        let _mdrTodos = [];
+        let _mdrTab = 'all';
+
+        function openMemberDrawer(username, role, dept, email, lastLogin, skills) {
+            _mdrUser = { username, role, dept, email, lastLogin, skills };
+            _mdrTab = 'all';
+            _mdrTodos = [];
+
+            // Populate header
+            const av = document.getElementById('mdrAvatar');
+            const un = document.getElementById('mdrUsername');
+            const rl = document.getElementById('mdrRole');
+            const dp = document.getElementById('mdrDept');
+            const mt = document.getElementById('mdrMeta');
+            const sk = document.getElementById('mdrSkills');
+
+            if (av) av.textContent = (username || '?').charAt(0).toUpperCase();
+            if (un) un.textContent = username;
+            if (rl) { rl.textContent = role || ''; rl.style.display = role ? '' : 'none'; }
+            if (dp) { dp.textContent = dept || ''; dp.style.display = dept ? '' : 'none'; }
+
+            // Skills badges
+            if (sk) {
+                sk.innerHTML = (skills || '').split(',').map(s => s.trim()).filter(Boolean).map(skill => `
+                    <span style="font-size:10px;padding:2px 8px;border-radius:4px;
+                                 background:rgba(255,255,255,0.15);color:#fff;border:1px solid rgba(255,255,255,0.2);">
+                        ${escapeHtml(skill)}
+                    </span>
+                `).join('');
+                sk.style.display = (skills && skills.trim()) ? 'flex' : 'none';
+            }
+
+            const meta = [];
+            if (email) meta.push('✉️ ' + email);
+            if (lastLogin && lastLogin !== 'undefined') meta.push('🕐 Last login: ' + new Date(lastLogin).toLocaleString());
+            if (mt) mt.textContent = meta.join('   ');
+
+            // Clear KPI & body
+            const kpiEl = document.getElementById('mdrKpi');
+            if (kpiEl) kpiEl.innerHTML = '';
+            const body = document.getElementById('mdrBody');
+            if (body) body.innerHTML = `
+                <div style="text-align:center;padding:48px 20px;color:#64748b;">
+                    <div style="font-size:40px;margin-bottom:10px;">⏳</div>
+                    <div style="font-weight:700;font-size:15px;">Loading todos for <b>${username}</b>...</div>
+                </div>`;
+
+            // Reset tab UI
+            mdrSetTabUI('all');
+
+            // Show overlay + panel
+            const overlay = document.getElementById('mdrOverlay');
+            const panel = document.getElementById('mdrPanel');
+            if (overlay) overlay.style.display = 'block';
+            if (panel) {
+                panel.style.display = 'flex';
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    panel.style.transform = 'translateX(0)';
+                }));
+            }
+
+            // Fetch todos directly from Supabase
+            _mdrFetchTodos(username);
+        }
+
+        function closeMemberDrawer() {
+            const panel = document.getElementById('mdrPanel');
+            const overlay = document.getElementById('mdrOverlay');
+            if (panel) {
+                panel.style.transform = 'translateX(100%)';
+                setTimeout(() => { panel.style.display = 'none'; }, 320);
+            }
+            if (overlay) overlay.style.display = 'none';
+            _mdrUser = null;
+            _mdrTodos = [];
+        }
+
+        async function _mdrFetchTodos(username) {
+            try {
+                const client = getSupabase();
+                if (!client) throw new Error('No DB connection');
+
+                // Fetch todos where user is creator, assignee or completed_by
+                const [r1, r2, r3] = await Promise.all([
+                    client.from('todos').select('id,title,task_status,completed,due_date,priority,description,assigned_to,username,created_at,approval_status').eq('username', username),
+                    client.from('todos').select('id,title,task_status,completed,due_date,priority,description,assigned_to,username,created_at,approval_status').eq('assigned_to', username),
+                    client.from('todos').select('id,title,task_status,completed,due_date,priority,description,assigned_to,username,created_at,approval_status').eq('completed_by', username)
+                ]);
+
+                const seen = new Set();
+                _mdrTodos = [];
+                for (const r of [r1, r2, r3]) {
+                    for (const t of (r.data || [])) {
+                        if (!seen.has(t.id)) { seen.add(t.id); _mdrTodos.push(t); }
+                    }
+                }
+
+                // Apply the same date range filter that is active on the Team section
+                const _mdrDateFilter = document.getElementById('teamFilterDate')?.value || 'all';
+                if (_mdrDateFilter !== 'all') {
+                    const _dn = new Date();
+                    const _dt = new Date(_dn.getFullYear(), _dn.getMonth(), _dn.getDate());
+                    _mdrTodos = _mdrTodos.filter(t => {
+                        const ref = t.created_at || t.due_date;
+                        if (!ref) return false;
+                        const d = new Date(ref);
+                        const dOnly = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+                        if (_mdrDateFilter === 'today')      return dOnly.toDateString() === _dt.toDateString();
+                        if (_mdrDateFilter === 'last7days')  { const s = new Date(_dt); s.setDate(_dt.getDate() - 7);  return dOnly >= s; }
+                        if (_mdrDateFilter === 'last30days') { const s = new Date(_dt); s.setDate(_dt.getDate() - 30); return dOnly >= s; }
+                        if (_mdrDateFilter === 'thismonth')  return d.getMonth() === _dn.getMonth() && d.getFullYear() === _dn.getFullYear();
+                        return true;
+                    });
+                    // Show active filter badge in drawer meta line
+                    const _lblMap = { today: 'Today', last7days: 'Last 7 Days', last30days: 'Last 30 Days', thismonth: 'This Month' };
+                    const mt = document.getElementById('mdrMeta');
+                    if (mt && _lblMap[_mdrDateFilter]) {
+                        mt.textContent = (mt.textContent ? mt.textContent + '   ' : '') + '🗓️ ' + _lblMap[_mdrDateFilter];
+                    }
+                }
+
+                // Build KPI
+                const now = new Date();
+                const kpi = { total: _mdrTodos.length, done: 0, progress: 0, pending: 0, overdue: 0, today: 0 };
+                _mdrTodos.forEach(t => {
+                    if (t.completed || t.task_status === 'done') { kpi.done++; return; }
+                    if (t.task_status === 'in_progress') { kpi.progress++; }
+                    else { kpi.pending++; }
+                    if (t.due_date) {
+                        const d = new Date(t.due_date);
+                        if (d < now) kpi.overdue++;
+                        if (d.toDateString() === now.toDateString()) kpi.today++;
+                    }
+                });
+
+                const kpiEl = document.getElementById('mdrKpi');
+                if (kpiEl) {
+                    kpiEl.innerHTML = [
+                        ['Total',   kpi.total,    'rgba(255,255,255,0.22)', '#fff'],
+                        ['Done',    kpi.done,     '#dcfce7', '#166534'],
+                        ['Active',  kpi.progress, '#ecfccb', '#3f6212'],
+                        ['Pending', kpi.pending,  '#fef9c3', '#713f12'],
+                        ['Overdue', kpi.overdue,  '#fee2e2', '#991b1b'],
+                        ['Today',   kpi.today,    '#fef3c7', '#92400e']
+                    ].map(([lbl, val, bg, col]) =>
+                        `<div style="text-align:center;padding:6px 2px;border-radius:7px;background:${bg};
+                                     cursor:pointer;" onclick="mdrSetTab('${lbl.toLowerCase()}')">
+                             <div style="font-size:16px;font-weight:800;color:${col};line-height:1;">${val}</div>
+                             <div style="font-size:9px;font-weight:700;color:${col};opacity:.85;margin-top:2px;">${lbl}</div>
+                         </div>`
+                    ).join('');
+                }
+
+                _mdrRender();
+            } catch (err) {
+                console.error('[MemberDrawer] fetch error:', err);
+                const body = document.getElementById('mdrBody');
+                if (body) body.innerHTML = `
+                    <div style="text-align:center;padding:48px 20px;color:#F43F5E;">
+                        <div style="font-size:40px;margin-bottom:10px;">⚠️</div>
+                        <div style="font-weight:700;">Failed to load todos</div>
+                        <div style="font-size:12px;color:#64748b;margin-top:6px;">${err.message || ''}</div>
+                    </div>`;
+            }
+        }
+
+        function mdrSetTab(tab) {
+            // Map kpi label clicks to tab names
+            const map = { total: 'all', done: 'done', active: 'progress', pending: 'pending', overdue: 'overdue', today: 'today' };
+            _mdrTab = map[tab] || tab;
+            mdrSetTabUI(_mdrTab);
+            _mdrRender();
+        }
+
+        function mdrSetTabUI(active) {
+            const tabs = { all: 'mdrTabAll', pending: 'mdrTabPending', progress: 'mdrTabProgress', done: 'mdrTabDone', overdue: 'mdrTabOverdue' };
+            Object.entries(tabs).forEach(([key, id]) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                const isActive = key === active;
+                el.style.color = isActive ? '#6366F1' : '#64748b';
+                el.style.borderBottomColor = isActive ? '#6366F1' : 'transparent';
+                el.style.fontWeight = isActive ? '700' : '600';
+            });
+        }
+
+        function _mdrRender() {
+            const body = document.getElementById('mdrBody');
+            if (!body) return;
+
+            if (!_mdrTodos.length) {
+                body.innerHTML = `
+                    <div style="text-align:center;padding:56px 20px;color:#64748b;">
+                        <div style="font-size:48px;margin-bottom:12px;">📭</div>
+                        <div style="font-size:15px;font-weight:700;color:#1E293B;margin-bottom:6px;">No Todos Found</div>
+                        <div style="font-size:13px;">This user has no tasks yet.</div>
+                    </div>`;
+                return;
+            }
+
+            const now = new Date();
+            let list = _mdrTodos;
+
+            // Tab filter
+            if (_mdrTab === 'done')     list = list.filter(t => t.completed || t.task_status === 'done');
+            else if (_mdrTab === 'progress') list = list.filter(t => !t.completed && t.task_status === 'in_progress');
+            else if (_mdrTab === 'pending')  list = list.filter(t => !t.completed && t.task_status !== 'in_progress' && t.task_status !== 'done' && !(t.due_date && new Date(t.due_date) < now));
+            else if (_mdrTab === 'overdue')  list = list.filter(t => !t.completed && t.due_date && new Date(t.due_date) < now);
+            else if (_mdrTab === 'today')    list = list.filter(t => t.due_date && new Date(t.due_date).toDateString() === now.toDateString());
+
+            if (!list.length) {
+                body.innerHTML = `<div style="text-align:center;padding:40px 20px;color:#94a3b8;font-size:14px;font-weight:600;">No tasks in this category.</div>`;
+                return;
+            }
+
+            // Sort: pending/active first, done last
+            list = [...list].sort((a, b) => {
+                const aD = a.completed ? 1 : 0, bD = b.completed ? 1 : 0;
+                if (aD !== bD) return aD - bD;
+                if (a.due_date && b.due_date) return new Date(a.due_date) - new Date(b.due_date);
+                return 0;
+            });
+
+            const fmtDate = d => d ? new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
+            const prioBadge = p => {
+                if (!p) return '';
+                const map = { high: ['#fee2e2','#991b1b','🔴'], medium: ['#fef3c7','#92400e','🟡'], low: ['#dcfce7','#166534','🟢'] };
+                const [bg, col, ic] = map[p] || ['#f1f5f9','#334155','⚪'];
+                return `<span style="font-size:10px;padding:1px 6px;border-radius:4px;background:${bg};color:${col};font-weight:700;">${ic} ${p}</span>`;
+            };
+            const statusBadge = t => {
+                if (t.completed || t.task_status === 'done') return `<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:#dcfce7;color:#166534;font-weight:700;">✅ Done</span>`;
+                if (t.task_status === 'in_progress') return `<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:#ecfccb;color:#3f6212;font-weight:700;">🚀 Active</span>`;
+                if (t.due_date && new Date(t.due_date) < now) return `<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:#fee2e2;color:#991b1b;font-weight:700;">🔴 Overdue</span>`;
+                return `<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:#fef9c3;color:#713f12;font-weight:700;">⏳ Pending</span>`;
+            };
+
+            body.innerHTML = list.map(t => {
+                const isOverdue = !t.completed && t.due_date && new Date(t.due_date) < now;
+                return `
+                <div style="background:#fff;border-radius:10px;padding:12px 14px;margin-bottom:8px;
+                            border:1px solid ${isOverdue ? '#fca5a5' : '#e2e8f0'};
+                            border-left:4px solid ${t.completed ? '#10b981' : isOverdue ? '#F43F5E' : t.task_status === 'in_progress' ? '#84cc16' : '#6366F1'};">
+                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px;">
+                        <div style="font-size:13px;font-weight:700;color:#1E293B;flex:1;line-height:1.35;">${t.title || '(Untitled)'}</div>
+                        <div style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">
+                            ${statusBadge(t)}
+                            ${prioBadge(t.priority)}
+                        </div>
+                    </div>
+                    ${t.description ? `<div style="font-size:12px;color:#64748b;margin-bottom:4px;line-height:1.4;">${t.description.substring(0, 120)}${t.description.length > 120 ? '…' : ''}</div>` : ''}
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px;">
+                        ${t.due_date ? `<span style="font-size:11px;color:${isOverdue ? '#991b1b' : '#64748b'};font-weight:600;">📅 ${fmtDate(t.due_date)}</span>` : ''}
+                        ${t.assigned_to && t.assigned_to !== (_mdrUser && _mdrUser.username) ? `<span style="font-size:11px;color:#6366F1;font-weight:600;">👤 → ${t.assigned_to}</span>` : ''}
+                        ${t.username && t.username !== (_mdrUser && _mdrUser.username) ? `<span style="font-size:11px;color:#0891b2;font-weight:600;">✍️ by ${t.username}</span>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function mdrGoToFullList() {
+            const username = _mdrUser && _mdrUser.username;
+            closeMemberDrawer();
+            if (username) filterByTeamMember(username);
+        }
+
+        /* ═══════════════════════════════════════════════════════
+           MULTI-ASSIGNMENT HELPER FUNCTIONS
+           ═══════════════════════════════════════════════════════ */
+
+        /** Load all users into the MA selector panel */
+        async function maLoadUsers() {
+            const list = document.getElementById('maUserList');
+            if (!list) return;
+            list.innerHTML = '<div style="text-align:center;padding:20px;color:#64748b;">Loading users…</div>';
+            try {
+                const client = getSupabase();
+                const isAdminOrSM = currentUser?.username === 'admin' || currentUser?.role === 'Super Manager' || currentUser?.role === 'Admin';
+                const { data: users } = await client.from('users').select('username, role, department').order('username');
+                // For Admin/Super Manager, show ALL users; for others, exclude current user
+                window._maAllUsers = isAdminOrSM ? (users || []) : (users || []).filter(u => u.username !== currentUser?.username);
+                // Populate dept filter
+                const deptFilter = document.getElementById('maDeptFilter');
+                if (deptFilter) {
+                    const depts = [...new Set(window._maAllUsers.map(u => u.department).filter(Boolean))].sort();
+                    deptFilter.innerHTML = '<option value="">All Departments</option>' + depts.map(d => `<option value="${d}">${d}</option>`).join('');
+                }
+                maFilterUsers();
+            } catch(e) {
+                if (list) list.innerHTML = '<div style="text-align:center;padding:20px;color:#ef4444;">Failed to load users</div>';
+            }
+        }
+
+        /** Filter the MA user list by search text + dept */
+        function maFilterUsers() {
+            const list = document.getElementById('maUserList');
+            if (!list || !window._maAllUsers) return;
+            const q = (document.getElementById('maSearchInput')?.value || '').toLowerCase();
+            const dept = (document.getElementById('maDeptFilter')?.value || '');
+            const filtered = window._maAllUsers.filter(u => {
+                const matchQ = !q || (u.username||'').toLowerCase().includes(q) || (u.department||'').toLowerCase().includes(q);
+                const matchD = !dept || dept === 'all' || u.department === dept;
+                return matchQ && matchD;
+            });
+            list.innerHTML = filtered.length === 0
+                ? '<div style="text-align:center;padding:16px;color:#94a3b8;font-size:13px;">No users found</div>'
+                : filtered.map(u => {
+                    const sel = (window._maSelected || new Set()).has(u.username);
+                    return `<label style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;cursor:pointer;background:${sel?'#cffafe':'#f8fafc'};margin-bottom:4px;border:1px solid ${sel?'#06b6d4':'#e2e8f0'};transition:all 0.15s;">
+                        <input type="checkbox" value="${u.username}" ${sel?'checked':''} onchange="maToggleUser('${u.username}',this.checked)" style="width:16px;height:16px;accent-color:#06b6d4;cursor:pointer;flex-shrink:0;">
+                        <span style="font-size:13px;font-weight:600;color:#1e293b;flex:1;">${escapeHtml(u.username)}</span>
+                        <span style="font-size:11px;color:#64748b;">${escapeHtml(u.department||'')} · ${escapeHtml(u.role||'')}</span>
+                    </label>`;
+                }).join('');
+            maUpdateSelectedCount();
+        }
+
+        /** Toggle a user in the _maSelected set */
+        function maToggleUser(username, checked) {
+            if (!window._maSelected) window._maSelected = new Set();
+            if (checked) window._maSelected.add(username);
+            else window._maSelected.delete(username);
+            maFilterUsers();   // re-render to update highlights
+        }
+
+        /** Select all currently visible users */
+        function maSelectAll() {
+            if (!window._maSelected) window._maSelected = new Set();
+            const list = document.getElementById('maUserList');
+            if (!list) return;
+            list.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                window._maSelected.add(cb.value);
+                cb.checked = true;
+            });
+            maFilterUsers();
+        }
+
+        /** Clear all selected users */
+        function maClearAll() {
+            window._maSelected = new Set();
+            maFilterUsers();
+        }
+
+        /** Update the selected-count badge */
+        function maUpdateSelectedCount() {
+            const cnt = document.getElementById('maSelectedCount');
+            if (cnt) {
+                const n = (window._maSelected || new Set()).size;
+                cnt.textContent = `${n} user${n!==1?'s':''} selected`;
+                cnt.style.background = n > 0 ? '#06b6d4' : '#94a3b8';
+            }
+        }
+
+        /** Update the current user's own status in a multi-assignment task */
+        async function maUpdateMyStatus(todoId, newStatus) {
+            if (!todoId || !currentUser?.username) return;
+            // If completing, show feedback modal instead of prompt
+            if (newStatus === 'completed') {
+                // Find the task title for the modal
+                const todo = todosCache.data.find(t => t.id === todoId);
+                if (todo) {
+                    document.getElementById('maSubmissionTaskTitle').textContent = escapeHtml(todo.title);
+                    document.getElementById('maSubmissionFeedback').value = '';
+                    document.getElementById('maSubmissionFeedbackError').style.display = 'none';
+                    document.getElementById('maSubmissionFeedbackModal').style.display = 'flex';
+                    document.getElementById('maSubmissionFeedback').focus();
+                    // Store the todoId for later use when confirming
+                    window._maPendingSubmissionTodoId = todoId;
+                }
+                return;
+            }
+            // For in_progress, proceed directly
+            await maUpdateMyStatusDirect(todoId, newStatus, '');
+        }
+
+        async function maUpdateMyStatusDirect(todoId, newStatus, feedback) {
+            if (!todoId || !currentUser?.username) return;
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos')
+                    .select('multi_assignment, task_status, completed, approval_status')
+                    .eq('id', todoId)
+                    .single();
+                if (!row) { showToast('Task not found', 'error'); return; }
+                let ma = row.multi_assignment;
+                if (!ma || !ma.enabled) { showToast('Not a multi-assignment task', 'error'); return; }
+                const idx = (ma.assignees||[]).findIndex(a => (a.username||'').toLowerCase() === (currentUser.username||'').toLowerCase());
+                if (idx < 0) { showToast('You are not an assignee of this task', 'error'); return; }
+                const now = new Date().toISOString();
+                ma.assignees[idx] = { ...ma.assignees[idx], status: newStatus,
+                    ...(newStatus === 'completed' ? { completed_at: now, notes: feedback.trim() } : {}),
+                    ...(newStatus === 'in_progress' ? { started_at: now } : {}) };
+                // Recalculate completion percentage
+                const completed = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completed / ma.assignees.length) * 100);
+                ma.all_completed = ma.assignees.every(a => ['completed','accepted'].includes(a.status));
+                // Keep base task status in sync (for live portal updates)
+                const anyInProgress = ma.assignees.some(a => a.status === 'in_progress');
+                const anyCompleted = ma.assignees.some(a => ['completed','accepted'].includes(a.status));
+                let nextTaskStatus = row.task_status || (row.completed ? 'done' : 'todo');
+                if (!row.completed && (anyInProgress || anyCompleted)) nextTaskStatus = 'in_progress';
+
+                const updatePayload = {
+                    multi_assignment: ma,
+                    updated_at: now
+                };
+                if (!row.completed && nextTaskStatus && nextTaskStatus !== row.task_status) {
+                    updatePayload.task_status = nextTaskStatus;
+                }
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                const label = newStatus === 'in_progress' ? 'Task started!' : 'Task marked as done! Waiting for creator review.';
+                showToast(label, 'success');
+                clearCache('todo'); loadTodos(true, true);
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) {
+                showToast('Failed to update status: ' + (e.message || e), 'error');
+            }
+        }
+
+        /** Creator accepts a specific assignee's completion */
+        async function maAcceptAssignee(todoId, assigneeUsername) {
+            if (!todoId || !assigneeUsername) return;
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos')
+                    .select('multi_assignment, task_status, completed, approval_status')
+                    .eq('id', todoId)
+                    .single();
+                if (!row) return;
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) return;
+                const idx = (ma.assignees||[]).findIndex(a => (a.username||'').toLowerCase() === assigneeUsername.toLowerCase());
+                if (idx < 0) return;
+                const now = new Date().toISOString();
+                ma.assignees[idx] = { ...ma.assignees[idx], status: 'accepted', accepted_at: now, accepted_by: currentUser?.username };
+                const completed = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completed / ma.assignees.length) * 100);
+                const allAccepted = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
+                ma.all_completed = allAccepted;
+
+                const updatePayload = {
+                    multi_assignment: ma,
+                    updated_at: now
+                };
+
+                // When 100% accepted, mark the task as completed (same as other tasks)
+                if (allAccepted) {
+                    updatePayload.completed = true;
+                    updatePayload.completed_at = now;
+                    updatePayload.completed_by = currentUser?.username || null;
+                    updatePayload.approval_status = 'approved';
+                    updatePayload.task_status = 'done';
+                }
+
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                showToast(`✅ Accepted ${assigneeUsername}'s work!`, 'success');
+                clearCache('todo'); loadTodos(true, true);
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) { showToast('Accept failed: ' + (e.message || e), 'error'); }
+        }
+
+        /** Creator rejects a specific assignee's completion */
+        async function maRejectAssignee(todoId, assigneeUsername) {
+            const reason = prompt(`Feedback for rejecting ${assigneeUsername}'s work (required):`);
+            if (reason === null) return;   // cancelled
+            if (!reason || reason.trim() === '') {
+                showToast('Feedback is required for rejection', 'error');
+                return;
+            }
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos')
+                    .select('multi_assignment, task_status, completed')
+                    .eq('id', todoId)
+                    .single();
+                if (!row) return;
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) return;
+                const idx = (ma.assignees||[]).findIndex(a => (a.username||'').toLowerCase() === assigneeUsername.toLowerCase());
+                if (idx < 0) return;
+                ma.assignees[idx] = { ...ma.assignees[idx], status: 'in_progress', rejection_reason: reason, completed_at: null };
+                const completed = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completed / ma.assignees.length) * 100);
+                ma.all_completed = false;
+                const now = new Date().toISOString();
+                const updatePayload = {
+                    multi_assignment: ma,
+                    updated_at: now
+                };
+                if (!row.completed && row.task_status !== 'in_progress') {
+                    updatePayload.task_status = 'in_progress';
+                }
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                showToast(`Task sent back to ${assigneeUsername}`, 'info');
+                clearCache('todo'); loadTodos(true, true);
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) { showToast('Reject failed: ' + (e.message || e), 'error'); }
+        }
+
+        /** Creator reopens an accepted assignee's work */
+        async function maReopenAssignee(todoId, assigneeUsername) {
+            if (!todoId || !assigneeUsername) return;
+            // Show reopen feedback modal instead of prompt
+            document.getElementById('maReopenAssigneeName').textContent = escapeHtml(assigneeUsername);
+            document.getElementById('maReopenFeedback').value = '';
+            document.getElementById('maReopenFeedbackError').style.display = 'none';
+            document.getElementById('maReopenFeedbackModal').style.display = 'flex';
+            document.getElementById('maReopenFeedback').focus();
+            // Store the IDs for later use when confirming
+            window._maPendingReopenTodoId = todoId;
+            window._maPendingReopenAssignee = assigneeUsername;
+        }
+
+        async function maReopenAssigneeDirect(todoId, assigneeUsername, feedback) {
+            if (!todoId || !assigneeUsername) return;
+            try {
+                const {data: row, error: rowErr} = await client.from('todos').select('*').eq('id', todoId).single();
+                if (rowErr || !row) { showToast('Task not found', 'error'); return; }
+                let ma = null;
+                try { ma = row.multi_assignment ? (typeof row.multi_assignment === 'string' ? JSON.parse(row.multi_assignment) : row.multi_assignment) : null; } catch(e) {}
+                if (!ma || !ma.assignees) { showToast('Invalid multi-assignment data', 'error'); return; }
+                
+                // Find and reopen the assignee
+                const assignee = ma.assignees.find(a => a.username === assigneeUsername);
+                if (!assignee) { showToast('Assignee not found', 'error'); return; }
+                
+                assignee.status = 'in_progress';
+                assignee.notes = feedback;
+                assignee.accepted_at = null;
+                assignee.accepted_by = null;
+                
+                // Recalculate completion percentage
+                const completed = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completed / ma.assignees.length) * 100);
+                ma.all_completed = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
+
+                const now = new Date().toISOString();
+                const updatePayload = {
+                    multi_assignment: ma,
+                    updated_at: now
+                };
+
+                // If task was marked done by MA completion, reopen it
+                if (row.completed && row.task_status === 'done') {
+                    updatePayload.completed = false;
+                    updatePayload.completed_at = null;
+                    updatePayload.approval_status = 'approved';
+                    updatePayload.task_status = 'in_progress';
+                } else if (row.task_status !== 'in_progress') {
+                    updatePayload.task_status = 'in_progress';
+                }
+
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                showToast(`Reopened for ${assigneeUsername}`, 'info');
+                clearCache('todo'); loadTodos(true, true);
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) { showToast('Reopen failed: ' + (e.message || e), 'error'); }
+        }
+
+        /** Render the multi-assignment progress panel for the detail modal */
+        function renderMultiAssignPanel(details) {
+            let ma = null;
+            try { ma = details.multi_assignment ? (typeof details.multi_assignment === 'string' ? JSON.parse(details.multi_assignment) : details.multi_assignment) : null; } catch(e) {}
+            if (!ma || !ma.enabled) return '';
+
+            const assignees = ma.assignees || [];
+            const isCreator = (ma.created_by||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+            const pct = ma.completion_percentage || 0;
+            const statusColors = { pending:'#94a3b8', in_progress:'#06b6d4', completed:'#8b5cf6', accepted:'#10b981', rejected:'#ef4444' };
+            const statusLabels = { pending:'⏳ Pending', in_progress:'🚀 In Progress', completed:'✅ Done (review)', accepted:'🎉 Accepted', rejected:'❌ Rejected' };
+
+            const rows = assignees.map(a => {
+                const isMe = (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+                const sColor = statusColors[a.status] || '#94a3b8';
+                const sLabel = statusLabels[a.status] || a.status;
+                const actionBtns = isCreator && !isMe && a.status === 'completed'
+                    ? `<button onclick="maAcceptAssignee('${details.id}','${a.username}')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;margin-right:4px;">✅ Accept</button>
+                       <button onclick="maRejectAssignee('${details.id}','${a.username}')" style="background:#ef4444;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">❌ Reject</button>`
+                    : isCreator && !isMe && a.status === 'accepted'
+                        ? `<button onclick="maReopenAssignee('${details.id}','${a.username}')" style="background:#f59e0b;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">🔓 Reopen</button>`
+                    : isMe && a.status === 'pending'
+                        ? `<button onclick="maUpdateMyStatus('${details.id}','in_progress')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">🚀 Start Task</button>`
+                    : isMe && a.status === 'in_progress'
+                        ? `<button onclick="maUpdateMyStatus('${details.id}','completed')" style="background:#8b5cf6;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">⚡ Take Action</button>`
+                    : '';
+                const rejNote = a.rejection_reason ? `<div style="font-size:11px;color:#ef4444;margin-top:6px;padding:8px 10px;background:#fee2e2;border-left:3px solid #ef4444;border-radius:6px;">❌ Rejected: ${escapeHtml(a.rejection_reason)}</div>` : '';
+                const feedbackNote = a.notes ? `<div style="font-size:11px;color:#78350f;margin-top:6px;padding:8px 10px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:6px;"><strong>💬 Feedback:</strong> ${escapeHtml(a.notes)}</div>` : '';
+                return `<div style="display:flex;flex-direction:column;gap:10px;padding:10px 14px;border-radius:10px;background:${isMe?'#f0fdff':'#f8fafc'};border:1px solid ${isMe?'#a5f3fc':'#e2e8f0'};margin-bottom:6px;">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span style="font-weight:700;font-size:13px;color:#1e293b;min-width:120px;">${escapeHtml(a.username)}${isMe?' (you)':''}</span>
+                        <span style="font-size:12px;font-weight:700;color:${sColor};background:${sColor}15;padding:3px 10px;border-radius:20px;">${sLabel}</span>
+                        <div style="margin-left:auto;display:flex;gap:4px;">${actionBtns}</div>
+                    </div>
+                    <div>${rejNote}${feedbackNote}</div>
+                </div>`;
+            }).join('');
+
+            return `<div style="margin-bottom:24px;padding:18px;background:linear-gradient(135deg,#ecfeff 0%,#cffafe 100%);border:2px solid #a5f3fc;border-radius:16px;">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+                    <span style="font-size:22px;">👥</span>
+                    <h4 style="margin:0;color:#0e7490;font-size:16px;font-weight:800;">Multi-Assignment Progress</h4>
+                    <span style="margin-left:auto;font-size:13px;font-weight:700;color:#0e7490;">${pct}% Complete · ${assignees.length} Assignee${assignees.length!==1?'s':''}</span>
+                </div>
+                <div style="background:#e0f2fe;border-radius:99px;height:10px;overflow:hidden;margin-bottom:16px;">
+                    <div style="height:100%;background:linear-gradient(90deg,#06b6d4,#0891b2);border-radius:99px;width:${pct}%;transition:width 0.4s;"></div>
+                </div>
+                ${rows}
+                ${ma.all_completed ? '<div style="text-align:center;padding:8px;background:#dcfce7;border-radius:8px;color:#166534;font-weight:700;margin-top:8px;">🎉 All assignees have completed this task!</div>' : ''}
+            </div>`;
+        }
         </script>
 </body>
 
