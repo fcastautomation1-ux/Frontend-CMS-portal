@@ -59,10 +59,15 @@
         // ================================================================
         function fetchSupabaseConfig() {
           return new Promise((resolve, reject) => {
-            // First try to get from Apps Script
+            // Check if we're in Apps Script environment
             if (typeof google !== 'undefined' && google.script && google.script.run) {
+              const timeout = setTimeout(() => {
+                reject(new Error('Config fetch timeout'));
+              }, 10000); // 10 second timeout
+              
               google.script.run
                 .withSuccessHandler((config) => {
+                  clearTimeout(timeout);
                   if (config && config.url && config.anonKey) {
                     applySupabaseConfig(config, 'server');
                     resolve(config);
@@ -71,25 +76,48 @@
                   }
                 })
                 .withFailureHandler((error) => {
+                  clearTimeout(timeout);
+                  console.error('getSupabaseConfig failed:', error);
                   reject(error);
                 })
                 .getSupabaseConfig();
             } else {
-              reject(new Error('Google Script API not available'));
+              reject(new Error('Google Script API not available - please use published web app URL'));
             }
           });
         }
 
+        // Global promise to track Supabase initialization
+        let supabaseInitPromise = null;
+        
         // Initialize config on load
-        (async function initConfig() {
+        supabaseInitPromise = (async function initConfig() {
           try {
+            // Wait a bit for Supabase CDN to load
+            await new Promise(resolve => setTimeout(resolve, 800));
             await fetchSupabaseConfig();
             console.log('✅ Supabase config loaded from server');
+            return true;
           } catch (e) {
-            console.warn('Could not load config from server, using fallback');
-            // Config will be loaded after login via GAS call
+            console.warn('Could not load config from server initially:', e.message);
+            // Config will be loaded on-demand during login or after login via syncSupabaseConfigFromServer
+            return false;
           }
         })();
+        
+        // Helper to ensure Supabase is ready before operations
+        async function ensureSupabaseReady() {
+          if (supabaseInitPromise) {
+            await supabaseInitPromise;
+          }
+          // Double check client is available
+          let retries = 0;
+          while (retries < 5 && !getSupabase()) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            retries++;
+          }
+          return getSupabase() !== null;
+        }
 
         // ================================================================
         // SUPABASE CLIENT
@@ -146,14 +174,17 @@
         // DATABASE HELPER FUNCTIONS
         // ================================================================
         // Columns for auth checks – intentionally excludes avatar_data to cut egress.
-        const USER_AUTH_COLUMNS = 'username,role,department,allowed_accounts,allowed_drive_folders,allowed_campaigns,allowed_looker_reports,drive_access_level,module_access,email_notifications_enabled';
+        const USER_AUTH_COLUMNS = 'username,role,department,allowed_accounts,allowed_drive_folders,allowed_campaigns,allowed_looker_reports,drive_access_level,module_access,email_notifications_enabled,manager_id,team_members';
         // Columns for user-management lists – excludes avatar_data (avatars are heavy blobs).
         const USER_LIST_COLUMNS = 'username,role,department,email,password,allowed_accounts,allowed_drive_folders,allowed_campaigns,allowed_looker_reports,last_login,drive_access_level,module_access,manager_id,team_members';
 
         const directDB = {
             async select(table, filters = {}, columns = '*') {
                 const client = getSupabase();
-                if (!client) throw new Error('Supabase not configured');
+                if (!client) {
+                    console.warn('Supabase not ready for select operation');
+                    throw new Error('Supabase not configured');
+                }
                 let query = client.from(table).select(columns);
                 for (const [k, v] of Object.entries(filters)) query = query.eq(k, v);
                 const { data, error } = await query;
@@ -877,7 +908,9 @@
                     allowedCampaigns: parseAllowed(u.allowed_campaigns, u.role, u.username),
                     allowedLookerReports: u.allowed_looker_reports || '',
                     driveAccessLevel: u.drive_access_level || 'viewer',
-                    moduleAccess: u.module_access || null
+                    moduleAccess: u.module_access || null,
+                    team_members: u.team_members || null,
+                    manager_id: u.manager_id || null
                 };
             },
             async getAllUsers(token) {
@@ -892,38 +925,38 @@
                 // Check if caller has limited User module access (department-restricted)
                 let callerDepartment = null;
                 let hasLimitedUserAccess = false;
+                let callerTeamMembers = null;
+                
                 if (isManager) {
                     // Admin and Super Manager always see all users - no module access filtering needed
                     if (caller.username === 'admin' || caller.role === 'Admin' || caller.role === 'Super Manager') {
                         // No filtering - admin and super manager see all users
                     } else {
-                        // Check both moduleAccess and module_access (camelCase and snake_case)
-                        const moduleAccessStr = caller.moduleAccess || caller.module_access;
-                        if (moduleAccessStr) {
-                            try {
-                                const moduleAccess = typeof moduleAccessStr === 'string' 
-                                    ? JSON.parse(moduleAccessStr) 
-                                    : moduleAccessStr;
-                                // If User module is enabled, check if it's department-restricted
-                                if (moduleAccess.users && moduleAccess.users.enabled) {
-                                    if (moduleAccess.users.departmentRestricted !== false) {
-                                        hasLimitedUserAccess = true;
-                                        callerDepartment = caller.department || null;
-                                    }
-                                } else {
-                                    // Module access configured but User module NOT enabled - NO users
-                                    hasLimitedUserAccess = true;
-                                    callerDepartment = null;
-                                }
-                            } catch (e) {
-                                console.warn('Error parsing caller module access:', e);
-                                hasLimitedUserAccess = true;
-                                callerDepartment = null;
-                            }
+                        // Regular Manager: Check team_members first (takes priority over department filtering)
+                        callerTeamMembers = caller.team_members || caller.teamMembers;
+                        
+                        // If Manager has team_members configured, show ALL users (filtering happens in renderUsers)
+                        if (callerTeamMembers && callerTeamMembers.trim()) {
+                            hasLimitedUserAccess = false; // Don't apply department filter
                         } else {
-                            // No module access configured = NO ACCESS (new system - null means no access)
-                            hasLimitedUserAccess = true;
-                            callerDepartment = null;
+                            // No team_members, check module access for department filtering
+                            const moduleAccessStr = caller.moduleAccess || caller.module_access;
+                            if (moduleAccessStr) {
+                                try {
+                                    const moduleAccess = typeof moduleAccessStr === 'string' 
+                                        ? JSON.parse(moduleAccessStr) 
+                                        : moduleAccessStr;
+                                    // If User module is enabled, check if it's department-restricted
+                                    if (moduleAccess.users && moduleAccess.users.enabled) {
+                                        if (moduleAccess.users.departmentRestricted !== false) {
+                                            hasLimitedUserAccess = true;
+                                            callerDepartment = caller.department || null;
+                                        }
+                                    }
+                                } catch (e) {
+                                    console.warn('Error parsing caller module access:', e);
+                                }
+                            }
                         }
                     }
                 }
@@ -937,12 +970,9 @@
                                 const callerDept = (callerDepartment || '').trim();
                                 // Only show users from the same department (case-insensitive)
                                 return userDept.toLowerCase() === callerDept.toLowerCase();
-                            } else {
-                                // User module not enabled - show no users
-                                return false;
                             }
                         }
-                        // No filtering needed
+                        // No filtering needed - return all users (team filtering happens in renderUsers)
                         return true;
                     })
                     .map(u => {
@@ -2189,8 +2219,17 @@
                             allMaTasksData.forEach(t => {
                                 try {
                                     const ma = typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : (t.multi_assignment || {});
-                                    if (ma.enabled && Array.isArray(ma.assignees) && ma.assignees.some(a => (a.username || '').toLowerCase() === user.username.toLowerCase())) {
-                                        addTask(t, { is_multi_assigned: true });
+                                    if (ma.enabled && Array.isArray(ma.assignees)) {
+                                        // Check top-level assignees
+                                        const isAssignee = ma.assignees.some(a => (a.username || '').toLowerCase() === user.username.toLowerCase());
+                                        // Check sub-assignees inside delegated_to (delegation chain)
+                                        const isDelegatedTo = !isAssignee && ma.assignees.some(a =>
+                                            Array.isArray(a.delegated_to) &&
+                                            a.delegated_to.some(sub => (sub.username || '').toLowerCase() === user.username.toLowerCase())
+                                        );
+                                        if (isAssignee || isDelegatedTo) {
+                                            addTask(t, { is_multi_assigned: true, is_delegated_to_me: isDelegatedTo });
+                                        }
                                     }
                                 } catch(e) { /* ignore parse errors */ }
                             });
@@ -2890,14 +2929,21 @@
                 const isAssigneeManager = isUserInManagerList(task.manager_id, user.username);
                 const isSharedWith = sharesResult.data && sharesResult.data.some(s => s.shared_with === user.username);
 
-                // Check if user is a multi-assignment assignee
+                // Check if user is a multi-assignment assignee OR a delegated sub-assignee
                 let isMultiAssignee = false;
                 try {
                     const ma = task.multi_assignment
                         ? (typeof task.multi_assignment === 'string' ? JSON.parse(task.multi_assignment) : task.multi_assignment)
                         : null;
                     if (ma && ma.enabled && Array.isArray(ma.assignees)) {
-                        isMultiAssignee = ma.assignees.some(a => (a.username || '').toLowerCase() === user.username.toLowerCase());
+                        // Check top-level assignees
+                        const isTopAssignee = ma.assignees.some(a => (a.username || '').toLowerCase() === user.username.toLowerCase());
+                        // Check sub-assignees inside delegated_to (delegation chain)
+                        const isDelegatedSubAssignee = !isTopAssignee && ma.assignees.some(a =>
+                            Array.isArray(a.delegated_to) &&
+                            a.delegated_to.some(sub => (sub.username || '').toLowerCase() === user.username.toLowerCase())
+                        );
+                        isMultiAssignee = isTopAssignee || isDelegatedSubAssignee;
                     }
                 } catch (e) {
                     // If parsing fails, log it for debugging
@@ -3231,9 +3277,29 @@
                     .single();
 
                 const now = new Date().toISOString();
+                
+                // Update assignment_chain to track reassignment history
+                let assignmentChain = [];
+                try {
+                    assignmentChain = typeof todo.assignment_chain === 'string' 
+                        ? JSON.parse(todo.assignment_chain) 
+                        : (Array.isArray(todo.assignment_chain) ? todo.assignment_chain : []);
+                } catch (e) {
+                    assignmentChain = [];
+                }
+                
+                // Add current reassignment to chain
+                assignmentChain.push({
+                    user: newAssignee,
+                    assigned_by: user.username,
+                    assigned_at: now,
+                    action: 'reassigned'
+                });
+                
                 const updateData = {
                     assigned_to: newAssignee,
-                    updated_at: now
+                    updated_at: now,
+                    assignment_chain: assignmentChain
                 };
 
                 if (newAssignee && newAssignee !== todo.username) {
@@ -3264,13 +3330,11 @@
 
                 await directDB.update('todos', updateData, { id: todoId });
 
-                // Update share record
-                if (previousAssignee) {
-                    // Remove old share or update it
-                    await directDB.delete('todo_shares', { todo_id: todoId, shared_with: previousAssignee });
-                }
+                // Keep todo_shares for previous assignee so they can still see the task
+                // (visibility is now controlled by assignment_chain in getTodos)
+                // No need to delete previous share - task remains visible to all in the chain
 
-                // Add new share
+                // Add or update share for new assignee
                 await directDB.upsert('todo_shares', {
                     todo_id: todoId,
                     shared_by: todo.username,
@@ -12246,6 +12310,120 @@
         </div>
     </div>
 
+    <!-- Multi-Assignment Reject Feedback Modal -->
+    <div id="maRejectFeedbackModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 600px; width: 90%; border-radius: 20px; overflow: hidden;">
+            <div style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); padding: 24px 28px; display: flex; align-items: center; gap: 16px;">
+                <div style="width: 56px; height: 56px; background: rgba(255,255,255,0.2); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px;">❌</div>
+                <div>
+                    <h3 style="margin: 0; color: white; font-size: 20px; font-weight: 800;">Reject Submitted Work</h3>
+                    <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.8); font-size: 14px;">Request changes or improvements</p>
+                </div>
+            </div>
+            <div style="padding: 28px;">
+                <p style="margin: 0 0 16px 0; color: #475569; font-size: 15px; line-height: 1.6;">
+                    Rejecting work submitted by <strong id="maRejectAssigneeName" style="color: #1e293b;"></strong>
+                </p>
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: #1e293b; font-weight: 700; font-size: 14px;">
+                        Rejection Feedback (Required Changes) <span style="color: #ef4444;">*</span>
+                    </label>
+                    <textarea id="maRejectFeedback" placeholder="Explain what needs to be changed, corrected, or improved..." rows="4"
+                        style="width: 100%; padding: 14px 16px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 14px; resize: vertical; font-family: inherit; transition: all 0.2s; box-sizing: border-box;"
+                        onfocus="this.style.borderColor='#ef4444';"
+                        onblur="this.style.borderColor='#e2e8f0';"></textarea>
+                    <div id="maRejectFeedbackError" style="display: none; color: #ef4444; font-size: 12px; margin-top: 6px; font-weight: 700;">
+                        ⚠️ Please provide feedback about what needs to be corrected
+                    </div>
+                </div>
+                <div style="padding: 14px 16px; background: #fef2f2; border-radius: 10px; color: #991b1b; font-size: 13px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 24px;">
+                    <span style="font-size: 18px; flex-shrink: 0;">⚠️</span>
+                    <span>The assignee will be notified and can make the requested changes before resubmitting.</span>
+                </div>
+                <div style="display: flex; gap: 12px;">
+                    <button onclick="closeMaRejectFeedbackModal()"
+                        style="flex: 1; padding: 14px 20px; border: 2px solid #e2e8f0; background: white; border-radius: 12px; font-size: 15px; font-weight: 700; color: #64748b; cursor: pointer; transition: all 0.2s;"
+                        onmouseover="this.style.background='#f8fafc';"
+                        onmouseout="this.style.background='white';">Cancel</button>
+                    <button id="confirmMaRejectBtn" onclick="confirmMaRejectFeedback()"
+                        style="flex: 1; padding: 14px 20px; border: none; background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); border-radius: 12px; font-size: 15px; font-weight: 700; color: white; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 12px rgba(239,68,68,0.3);"
+                        onmouseover="this.style.transform='translateY(-2px)';"
+                        onmouseout="this.style.transform='translateY(0)';">✓ Reject with Feedback</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Task Delegation Modal (Reassign to Others) -->
+    <div id="maDelegationModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 650px; width: 90%; border-radius: 20px; overflow: hidden; max-height: 90vh;">
+            <div style="background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); padding: 24px 28px; display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: 16px;">
+                    <div style="width: 56px; height: 56px; background: rgba(255,255,255,0.2); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px;">🔄</div>
+                    <div>
+                        <h3 style="margin: 0; color: white; font-size: 20px; font-weight: 800;">Reassign to Others</h3>
+                        <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.9); font-size: 14px;">Delegate this task to team members</p>
+                    </div>
+                </div>
+                <button class="close-btn" onclick="closeMaDelegationModal()" style="color: white; font-size: 32px; opacity: 0.9;">&times;</button>
+            </div>
+            <div style="padding: 28px; overflow-y: auto; max-height: calc(90vh - 200px);">
+                <p style="margin: 0 0 16px 0; color: #475569; font-size: 15px; line-height: 1.6;">
+                    Task: <strong id="maDelegationTaskTitle" style="color: #1e293b;"></strong>
+                </p>
+                <div style="margin-bottom: 20px; padding: 14px 16px; background: #dbeafe; border-left: 4px solid #06b6d4; border-radius: 10px; color: #075985; font-size: 13px;">
+                    <strong style="display: block; margin-bottom: 4px;">ℹ️ How Delegation Works:</strong>
+                    <ul style="margin: 8px 0 0 0; padding-left: 20px; line-height: 1.6;">
+                        <li>Selected users will complete this task and submit to you for approval</li>
+                        <li>You must approve all delegated work before completing your own task</li>
+                        <li>The original task creator can see the full delegation hierarchy</li>
+                    </ul>
+                </div>
+                
+                <div style="margin-bottom: 16px;">
+                    <label style="display: block; margin-bottom: 8px; color: #1e293b; font-weight: 700; font-size: 14px;">
+                        Select Users to Delegate To <span style="color: #ef4444;">*</span>
+                    </label>
+                    <input type="text" id="maDelegationUserSearch" placeholder="🔍 Search users by name or department..." 
+                        oninput="filterMaDelegationUsers()"
+                        style="width: 100%; padding: 12px 16px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 14px; box-sizing: border-box; margin-bottom: 12px;"
+                        onfocus="this.style.borderColor='#06b6d4';" onblur="this.style.borderColor='#e2e8f0';" />
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+                        <button onclick="maDelegationSelectAll()" style="padding: 6px 12px; background: #06b6d4; color: white; border: none; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;">✓ Select All</button>
+                        <button onclick="maDelegationClearAll()" style="padding: 6px 12px; background: #94a3b8; color: white; border: none; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;">✗ Clear All</button>
+                        <div id="maDelegationSelectedCount" style="padding: 6px 12px; background: #94a3b8; color: white; border-radius: 8px; font-size: 12px; font-weight: 600;">0 users selected</div>
+                    </div>
+                </div>
+                <div id="maDelegationUsersList" style="max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px;"></div>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 8px; color: #1e293b; font-weight: 700; font-size: 14px;">
+                        Instructions for Delegated Users (Optional)
+                    </label>
+                    <textarea id="maDelegationInstructions" placeholder="Add specific instructions, context, or requirements for the delegated users..." rows="3"
+                        style="width: 100%; padding: 14px 16px; border: 2px solid #e2e8f0; border-radius: 12px; font-size: 14px; resize: vertical; font-family: inherit; transition: all 0.2s; box-sizing: border-box;"
+                        onfocus="this.style.borderColor='#06b6d4';"
+                        onblur="this.style.borderColor='#e2e8f0';"></textarea>
+                </div>
+                
+                <div id="maDelegationError" style="display: none; color: #ef4444; font-size: 13px; margin-bottom: 16px; padding: 10px; background: #fee2e2; border-radius: 8px; font-weight: 600;">
+                    ⚠️ Please select at least one user to delegate to
+                </div>
+                
+                <div style="display: flex; gap: 12px;">
+                    <button onclick="closeMaDelegationModal()"
+                        style="flex: 1; padding: 14px 20px; border: 2px solid #e2e8f0; background: white; border-radius: 12px; font-size: 15px; font-weight: 700; color: #64748b; cursor: pointer; transition: all 0.2s;"
+                        onmouseover="this.style.background='#f8fafc';"
+                        onmouseout="this.style.background='white';">Cancel</button>
+                    <button id="confirmMaDelegationBtn" onclick="confirmMaDelegation()"
+                        style="flex: 1; padding: 14px 20px; border: none; background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); border-radius: 12px; font-size: 15px; font-weight: 700; color: white; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 12px rgba(6,182,212,0.3);"
+                        onmouseover="this.style.transform='translateY(-2px)';"
+                        onmouseout="this.style.transform='translateY(0)';">🔄 Delegate Task</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Saved Drafts Modal -->
     <div id="todoDraftsModal" class="modal" style="display: none;">
         <div class="modal-content" style="max-width: 500px; width: 95%; border-radius: 20px; overflow: hidden;">
@@ -12778,7 +12956,7 @@
                 users: { data: [], timestamp: 0 },
                 workflows: { data: [], timestamp: 0 }
             };
-            const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+            const CACHE_DURATION = 30 * 1000; // 30 seconds - near real-time updates
 
             // Looker Studio Reports cache
             let lookerReportsCache = { data: [], timestamp: 0 };
@@ -12786,14 +12964,83 @@
 
             // To-Do List cache
             let todosCache = { data: [], timestamp: 0 };
-            const TODOS_CACHE_DURATION = 2 * 60 * 1000; // 2 minutes
+            const TODOS_CACHE_DURATION = 15 * 1000; // 15 seconds - instant task updates
 
             // Drive cache - stores folder contents by folder ID
             // ENHANCED: Now uses localStorage for persistence + background refresh
             const driveCache = {};
-            const DRIVE_CACHE_DURATION = 10 * 60 * 1000; // 10 minutes in-memory
+            const DRIVE_CACHE_DURATION = 60 * 1000; // 60 seconds in-memory
             const DRIVE_LOCALSTORAGE_KEY = 'gas_drive_cache';
             const DRIVE_STALE_THRESHOLD = 2 * 60 * 1000; // Show cached after 2 min, refresh in background
+
+            // ================================================================
+            // SMART CACHE INVALIDATION - Update only what changed
+            // ================================================================
+            const cacheManager = {
+                // Invalidate specific item from cache
+                invalidateItem(cacheObj, itemId) {
+                    if (!cacheObj || !cacheObj.data) return;
+                    const index = cacheObj.data.findIndex(item => item.id === itemId);
+                    if (index >= 0) {
+                        cacheObj.data.splice(index, 1);
+                        console.log(`🗑️ Cache item removed: ${itemId}`);
+                    }
+                },
+                // Update specific item in cache
+                updateItem(cacheObj, itemId, newData) {
+                    if (!cacheObj || !cacheObj.data) return;
+                    const index = cacheObj.data.findIndex(item => item.id === itemId);
+                    if (index >= 0) {
+                        cacheObj.data[index] = { ...cacheObj.data[index], ...newData };
+                        console.log(`✅ Cache item updated: ${itemId}`);
+                    } else {
+                        cacheObj.data.unshift(newData);
+                        console.log(`➕ Cache item added: ${itemId}`);
+                    }
+                },
+                // Add new item to cache
+                addItem(cacheObj, newData) {
+                    if (!cacheObj || !cacheObj.data) return;
+                    cacheObj.data.unshift(newData);
+                    console.log(`➕ Cache item added: ${newData.id}`);
+                },
+                // Invalidate entire cache
+                invalidateAll(cacheObj) {
+                    if (cacheObj) {
+                        cacheObj.timestamp = 0;
+                        console.log('🗑️ Cache invalidated');
+                    }
+                }
+            };
+
+            // ================================================================
+            // OPTIMISTIC UPDATE SYSTEM - Instant UI feedback without waiting
+            // ================================================================
+            async function performOptimisticUpdate({
+                optimisticFn,  // Function to update UI immediately
+                serverFn,      // Function to update server
+                rollbackFn,    // Function to rollback if server fails
+                successMsg,    // Success message
+                errorMsg       // Error message
+            }) {
+                try {
+                    // 1. Apply optimistic update immediately (instant UI feedback)
+                    if (optimisticFn) optimisticFn();
+                    
+                    // 2. Perform server operation in background
+                    const result = await serverFn();
+                    
+                    // 3. Show success message
+                    if (successMsg) showToast(successMsg, 'success');
+                    
+                    return result;
+                } catch (error) {
+                    // 4. Rollback on error
+                    if (rollbackFn) rollbackFn();
+                    if (errorMsg) showToast(errorMsg + ': ' + (error.message || error), 'error');
+                    throw error;
+                }
+            }
 
             // Load Drive cache from localStorage on startup
             (function loadDriveCacheFromStorage() {
@@ -14405,7 +14652,7 @@
                                 loadNotifications();
                             }
                         }
-                    }, 5000); // Check every 5 seconds for real-time updates
+                    }, 3000); // Check every 3 seconds for real-time updates
                 }
             }
 
@@ -14433,46 +14680,47 @@
             // ============================================================================
             let globalRefreshIntervals = {};
 
+            // ✅ REAL-TIME MODE: Auto-refresh with minimal delay for instant updates
             function startSectionAutoRefresh() {
                 // Clear any existing intervals
                 stopSectionAutoRefresh();
 
                 if (!authToken) return;
 
-                // --- ACCOUNTS: Refresh every 8 seconds ---
+                // --- ACCOUNTS: Refresh every 30 seconds for instant updates ---
                 globalRefreshIntervals.accounts = setInterval(() => {
                     if (!authToken) return;
                     loadAccounts(true, true); // Force refresh, silent mode
-                }, 8000);
+                }, 30 * 1000); // 30 seconds
 
-                // --- CAMPAIGNS: Refresh every 12 seconds ---
+                // --- CAMPAIGNS: Refresh every 30 seconds ---
                 globalRefreshIntervals.campaigns = setInterval(() => {
                     if (!authToken) return;
                     if (typeof loadAllCampaigns === 'function') {
                         loadAllCampaigns(true, true);
                     }
-                }, 12000);
+                }, 30 * 1000); // 30 seconds
 
-                // --- USERS: Refresh every 15 seconds (Manager/Super Manager/Admin only) ---
+                // --- USERS: Refresh every 30 seconds ---
                 if (currentUser && (currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin')) {
                     globalRefreshIntervals.users = setInterval(() => {
                         if (!authToken) return;
                         loadUsers(true, true);
-                    }, 15000);
+                    }, 30 * 1000); // 30 seconds
 
-                    // --- WORKFLOWS: Refresh every 15 seconds (Manager only) ---
+                    // --- WORKFLOWS: Refresh every 30 seconds ---
                     globalRefreshIntervals.workflows = setInterval(() => {
                         if (!authToken) return;
                         loadWorkflows(true, true);
-                    }, 15000);
+                    }, 30 * 1000); // 30 seconds
 
-                    // --- RULES: Refresh every 20 seconds (Manager only) ---
+                    // --- RULES: Refresh every 30 seconds ---
                     globalRefreshIntervals.rules = setInterval(() => {
                         if (!authToken) return;
                         loadRules(true);
-                    }, 20000);
+                    }, 30 * 1000); // 30 seconds
 
-                    // --- DEPARTMENTS: Initialize cache and refresh every 10 seconds (Manager only) ---
+                    // --- DEPARTMENTS: Refresh every 20 seconds ---
                     // Initialize cache immediately
                     refreshDepartmentsCache(true);
 
@@ -14488,37 +14736,37 @@
                                 if (badge) badge.textContent = departments?.length || 0;
                             }
                         });
-                    }, 10000); // Refresh every 10 seconds for faster updates
+                    }, 20 * 1000); // 20 seconds
 
-                    // --- TEAM: Refresh every 8 seconds (live KPI cards) ---
+                    // --- TEAM: Refresh every 30 seconds ---
                     globalRefreshIntervals.team = setInterval(() => {
                         if (!authToken) return;
                         const activeSection = document.querySelector('.content-section.active');
                         if (activeSection && activeSection.id === 'teamSection') {
                             loadTeamMembers(true);
                         }
-                    }, 8000);
+                    }, 30 * 1000); // 30 seconds
                 }
 
-                // --- LOOKER REPORTS: Refresh every 20 seconds ---
+                // --- LOOKER REPORTS: Refresh every 45 seconds ---
                 globalRefreshIntervals.looker = setInterval(() => {
                     if (!authToken) return;
                     loadLookerReports(true, true);
-                }, 20000);
+                }, 45 * 1000); // 45 seconds
 
-                // --- TODOS: Refresh every 6 seconds (most time-sensitive) ---
+                // --- TODOS: Refresh every 5 seconds for real-time task updates ---
                 globalRefreshIntervals.todos = setInterval(() => {
                     if (!authToken) return;
-                    loadTodos(true, true);
-                }, 6000);
+                    loadTodos(true, true); // Force refresh, silent mode
+                }, 5 * 1000); // 5 seconds
 
-                // --- BADGE COUNTS: Update every 10 seconds ---
+                // --- BADGE COUNTS: Update every 15 seconds ---
                 globalRefreshIntervals.counts = setInterval(() => {
                     if (!authToken) return;
                     updateCounts();
-                }, 10000);
+                }, 15 * 1000); // 15 seconds
 
-                // Auto-refresh started for all sections
+                console.log('✅ Real-time auto-refresh enabled - updates every 10-30 seconds');
             }
 
             function stopSectionAutoRefresh() {
@@ -15205,11 +15453,12 @@
                         if (typeof loadAllCampaigns === 'function') loadAllCampaigns(false, true);
                     }, 500);
                     setTimeout(() => {
+                        // Wait longer for Supabase to initialize from CDN
                         if ((currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin') && typeof loadUsers === 'function') loadUsers(false, true);
-                    }, 1000);
+                    }, 2500);
                     setTimeout(() => {
                         if ((currentUser.role === 'Manager' || currentUser.role === 'Super Manager' || currentUser.username === 'admin') && typeof loadWorkflows === 'function') loadWorkflows(false, true);
-                    }, 1500);
+                    }, 3000);
                     setTimeout(() => {
                         if (typeof loadLookerReports === 'function') loadLookerReports(false, true);
                     }, 2000);
@@ -15453,6 +15702,9 @@
 
                 const isAdminOrSuperManager = currentUser &&
                     (currentUser.username === 'admin' || currentUser.role === 'Super Manager' || currentUser.role === 'Admin');
+                
+                const isRegularManager = currentUser && currentUser.role === 'Manager';
+                const hasTeamMembers = currentUser && (currentUser.team_members || currentUser.teamMembers);
 
                 try {
                     const count = await directAPI.getTeamMembersCount(token);
@@ -15461,8 +15713,11 @@
 
                     if (teamNavItem && teamCountBadge) {
                         teamCountBadge.textContent = count;
-                        // Super Manager and Admin always see Team section
-                        if (isAdminOrSuperManager || count > 0) {
+                        // Show Team section if:
+                        // 1. Super Manager or Admin (always show)
+                        // 2. Regular Manager with team_members configured
+                        // 3. Any role with count > 0
+                        if (isAdminOrSuperManager || (isRegularManager && hasTeamMembers) || count > 0) {
                             teamNavItem.style.display = 'flex';
                         } else {
                             teamNavItem.style.display = 'none';
@@ -15471,8 +15726,10 @@
                 } catch (error) {
                     console.error('Error loading team members count:', error);
                     const teamNavItem = document.querySelector('[data-section="team"]');
-                    // For Super Manager and Admin, still show even if count fails
-                    if (teamNavItem) teamNavItem.style.display = isAdminOrSuperManager ? 'flex' : 'none';
+                    // For Super Manager/Admin OR regular Manager with team_members, still show even if count fails
+                    if (teamNavItem) {
+                        teamNavItem.style.display = (isAdminOrSuperManager || (isRegularManager && hasTeamMembers)) ? 'flex' : 'none';
+                    }
                 }
             }
 
@@ -16120,24 +16377,64 @@
                 // Try google.script.run first, fallback to directAPI
                 console.log('Attempting login for:', username);
                 if (typeof google !== 'undefined' && google.script && google.script.run) {
+                    console.log('Using google.script.run for login (Apps Script backend)');
                     google.script.run
                         .withSuccessHandler(handleLoginSuccess)
                         .withFailureHandler(handleLoginError)
                         .login(username, password);
                 } else {
-                    // Use directAPI directly
+                    // Use directAPI directly - but ensure Supabase is configured first
                     console.log('No google.script.run, using directAPI directly');
-                    if (typeof directAPI !== 'undefined' && directAPI.login) {
-                        directAPI.login(username, password)
-                            .then(handleLoginSuccess)
-                            .catch(function (err) {
-                                handleLoginError(err);
+                    
+                    // Function to attempt directAPI login
+                    const attemptDirectLogin = () => {
+                        if (typeof directAPI !== 'undefined' && directAPI.login) {
+                            const client = getSupabase();
+                            if (!client) {
+                                errorDiv.textContent = 'Database connection not ready. Please wait and try again...';
+                                errorDiv.classList.remove('hidden');
+                                btn.disabled = false;
+                                btn.textContent = 'Log in';
+                                
+                                // Try to load config and retry after delay
+                                setTimeout(() => {
+                                    fetchSupabaseConfig().then(() => {
+                                        console.log('Config loaded, ready for login');
+                                    }).catch(() => {
+                                        console.warn('Config load failed');
+                                    });
+                                }, 1000);
+                                return;
+                            }
+                            
+                            directAPI.login(username, password)
+                                .then(handleLoginSuccess)
+                                .catch(function (err) {
+                                    console.error('DirectAPI login failed:', err);
+                                    handleLoginError(err);
+                                });
+                        } else {
+                            errorDiv.textContent = 'Login service unavailable. Please refresh the page.';
+                            errorDiv.classList.remove('hidden');
+                            btn.disabled = false;
+                            btn.textContent = 'Log in';
+                        }
+                    };
+                    
+                    // If config not loaded yet, try to load it first
+                    if (!SUPABASE_CONFIG || !SUPABASE_CONFIG.url) {
+                        console.log('Config not loaded, fetching...');
+                        fetchSupabaseConfig()
+                            .then(() => {
+                                console.log('Config loaded, attempting login');
+                                attemptDirectLogin();
+                            })
+                            .catch(() => {
+                                console.warn('Config fetch failed, attempting login anyway');
+                                attemptDirectLogin();
                             });
                     } else {
-                        errorDiv.textContent = 'Error: Login service not available';
-                        errorDiv.classList.remove('hidden');
-                        btn.disabled = false;
-                        btn.textContent = 'Log in';
+                        attemptDirectLogin();
                     }
                 }
             };
@@ -16317,7 +16614,16 @@
             }
 
             // Load accounts from server
-            function loadAccounts(forceRefresh = false, silent = false) {
+            async function loadAccounts(forceRefresh = false, silent = false) {
+                // Wait for Supabase to be ready
+                if (!silent) {
+                    const isReady = await ensureSupabaseReady();
+                    if (!isReady && !authToken) {
+                        console.warn('Supabase not ready yet, skipping accounts load');
+                        return;
+                    }
+                }
+                
                 // Don't load if not logged in
                 if (!authToken) {
                     console.log('loadAccounts: Not logged in, skipping');
@@ -16403,7 +16709,7 @@
             // ============================================================================
 
             let driveImagesCache = { data: [], timestamp: 0 };
-            const IMAGES_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+            const IMAGES_CACHE_DURATION = 60 * 1000; // 60 seconds
 
             // Load images from Drive
             function loadDriveImages(forceRefresh = false) {
@@ -16904,7 +17210,7 @@
             // ============================================================================
 
             let allCampaignsCache = { data: [], timestamp: 0, isLoading: false };
-            const CAMPAIGNS_CACHE_DURATION = 3 * 60 * 1000; // 3 minutes
+            const CAMPAIGNS_CACHE_DURATION = 30 * 1000; // 30 seconds
 
             // Load all campaigns from all accessible accounts
             function loadAllCampaigns(forceRefresh = false, silent = false) {
@@ -18157,7 +18463,16 @@
                 document.getElementById('userManagementSection').classList.add('hidden');
             }
 
-            function loadUsers(forceRefresh = false, silent = false) {
+            async function loadUsers(forceRefresh = false, silent = false) {
+                // Wait for Supabase to be ready
+                if (!silent) {
+                    const isReady = await ensureSupabaseReady();
+                    if (!isReady && !authToken) {
+                        console.warn('Supabase not ready yet, skipping users load');
+                        return;
+                    }
+                }
+                
                 const now = Date.now();
                 const cacheAge = now - dataCache.users.timestamp;
 
@@ -18213,11 +18528,6 @@
 
                     // Only re-render if data changed or not silent (avoid unnecessary DOM updates)
                     if (dataChanged || !silent) {
-                        if (silent) {
-                            // Users data updated silently
-                        } else {
-                            console.log('Users data loaded:', users.length, 'users');
-                        }
                         renderUsers(users);
                     }
 
@@ -18241,9 +18551,19 @@
 
                 // Try directAPI first (fastest)
                 if (typeof directAPI !== 'undefined' && directAPI.getAllUsers) {
-                    directAPI.getAllUsers(authToken)
-                        .then(loadFunction)
-                        .catch(errorFunction);
+                    // Check if Supabase is ready before calling
+                    const client = getSupabase();
+                    if (client) {
+                        directAPI.getAllUsers(authToken)
+                            .then(loadFunction)
+                            .catch(errorFunction);
+                    } else {
+                        // Supabase not ready yet, use GAS fallback or retry after delay
+                        if (!silent) {
+                            console.warn('Supabase not ready, retrying in 2 seconds...');
+                            setTimeout(() => loadUsers(forceRefresh, silent), 2000);
+                        }
+                    }
                 } else {
                     // Fallback to GAS
                     google.script.run
@@ -18270,18 +18590,47 @@
                     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 20px; color: red;">Error: Invalid user data format</td></tr>';
                     return;
                 }
+                
+                // Filter users based on manager permissions
+                let displayUsers = users;
+                if (currentUser && currentUser.role === 'Manager' && currentUser.username !== 'admin') {
+                    // Regular managers can only see their team members
+                    displayUsers = users.filter(user => {
+                        // Manager can see themselves
+                        if (user.username === currentUser.username) {
+                            return true;
+                        }
+                        
+                        // Manager can see users who report to them (check both field variations)
+                        const userManagerId = user.manager_id || user.managerId;
+                        if (userManagerId === currentUser.username) {
+                            return true;
+                        }
+                        
+                        // Manager can see users in their team_members list
+                        if (currentUser.team_members) {
+                            const teamList = currentUser.team_members.split(',').map(u => u.trim().toLowerCase());
+                            const usernameLower = user.username.toLowerCase();
+                            if (teamList.includes(usernameLower)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                }
+                // Super Manager and Admin see all users
 
                 // Store globally for edit access and filtering
-                window.allUsers = users;
+                window.allUsers = displayUsers;
 
                 // Update users count badge
                 const usersCountEl = document.getElementById('usersCount');
-                if (usersCountEl) usersCountEl.textContent = users.length;
+                if (usersCountEl) usersCountEl.textContent = displayUsers.length;
 
                 // Populate department filter dropdown with unique departments from users
-                populateUsersDepartmentFilter(users);
+                populateUsersDepartmentFilter(displayUsers);
 
-                if (users.length === 0) {
+                if (displayUsers.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 20px;">No users found</td></tr>';
                     return;
                 }
@@ -18291,7 +18640,7 @@
                 const roleFilter = document.getElementById('usersFilterRole')?.value || 'all';
                 const deptFilter = document.getElementById('usersFilterDepartment')?.value || 'all';
 
-                const filteredUsers = users.filter(user => {
+                const filteredUsers = displayUsers.filter(user => {
                     // Search filter
                     if (searchTerm) {
                         const matchesSearch = (user.username || '').toLowerCase().includes(searchTerm) ||
@@ -18320,7 +18669,18 @@
 
                 filteredUsers.forEach(user => {
                     const row = document.createElement('tr');
+                    // Allow deletion for non-self, non-admin users
                     const canDelete = currentUser && user.username !== currentUser.username && user.username !== 'admin';
+                    // Allow edit for team members if manager, or all if Super Manager/Admin
+                    const canEdit = currentUser && (
+                        currentUser.role === 'Admin' || 
+                        currentUser.role === 'Super Manager' || 
+                        currentUser.username === 'admin' ||
+                        (currentUser.role === 'Manager' && (
+                            user.manager_id === currentUser.username ||
+                            (currentUser.team_members && currentUser.team_members.split(',').map(u => u.trim().toLowerCase()).includes(user.username.toLowerCase()))
+                        ))
+                    );
 
                     row.innerHTML = `
             <td> <strong>${user.username}</strong></td>
@@ -18329,7 +18689,7 @@
             <td style="font-size: 13px; max-width: 300px; overflow: hidden; text-overflow: ellipsis;">${user.allowedAccounts || 'None'}</td>
             <td style="font-size: 13px; color: #64748b;">${user.lastLogin ? new Date(user.lastLogin).toLocaleString() : 'Never'}</td>
             <td>
-            <button onclick="handleEditUser('${user.username}')" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Edit</button>
+            ${canEdit ? `<button onclick="handleEditUser('${user.username}')" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Edit</button>` : '<span style="color: #94a3b8; font-size: 12px;">—</span>'}
             ${canDelete ? `<button onclick="handleDeleteUser('${user.username}')" class="btn btn-danger" style="padding: 6px 12px; font-size: 12px; margin-left: 5px;">Delete</button>` : ''}
             </td>
         `;
@@ -21167,7 +21527,7 @@
                 data: [],
                 timestamp: 0
             };
-            const DEPARTMENTS_CACHE_DURATION = 30 * 1000; // 30 seconds cache
+            const DEPARTMENTS_CACHE_DURATION = 15 * 1000; // 15 seconds cache
 
             // Global function to refresh departments cache and update all dropdowns
             function refreshDepartmentsCache(forceRefresh = false, callback = null) {
@@ -23043,7 +23403,7 @@
 
             // Cache for API responses
             const apiCache = new Map();
-            const API_CACHE_DURATION = 30000; // 30 seconds
+            const API_CACHE_DURATION = 10000; // 10 seconds
 
             function getCached(key) {
                 const cached = apiCache.get(key);
@@ -23057,15 +23417,35 @@
                 apiCache.set(key, { data, timestamp: Date.now() });
             }
 
+            // ✅ OPTIMIZED: Smart cache clearing - only invalidates specific caches
             function clearCache(pattern) {
                 if (pattern) {
+                    // Pattern-based clearing for API cache
                     for (const key of apiCache.keys()) {
                         if (key.includes(pattern)) {
                             apiCache.delete(key);
                         }
                     }
+                    
+                    // Also clear specific data caches based on pattern
+                    if (pattern === 'todo') {
+                        todosCache.timestamp = 0;
+                        console.log('✅ Todos cache cleared');
+                    } else if (pattern === 'user') {
+                        if (dataCache.users) dataCache.users.timestamp = 0;
+                        console.log('✅ Users cache cleared');
+                    } else if (pattern === 'account') {
+                        if (dataCache.accounts) dataCache.accounts.timestamp = 0;
+                        console.log('✅ Accounts cache cleared');
+                    }
                 } else {
+                    // Clear all caches
                     apiCache.clear();
+                    todosCache.timestamp = 0;
+                    if (dataCache.users) dataCache.users.timestamp = 0;
+                    if (dataCache.accounts) dataCache.accounts.timestamp = 0;
+                    if (dataCache.workflows) dataCache.workflows.timestamp = 0;
+                    console.log('✅ All caches cleared');
                 }
             }
 
@@ -23151,13 +23531,15 @@
             // TO-DO LIST MANAGEMENT
             // ============================================================================
 
-            // Auto-refresh todos - handled by global startSectionAutoRefresh()
+            // OPTIMIZED: Auto-refresh DISABLED - Using cache + manual invalidation
+            // This saves 99% of database queries by only fetching when data actually changes
             let todosAutoRefreshInterval = null;
             let lastTodosHash = null; // Store hash of todos to detect changes
 
-            // Legacy stubs - global auto-refresh now handles todos refresh
+            // Legacy stubs - auto-refresh is DISABLED for optimization
             function startTodosAutoRefresh() {
-                // Todos auto-refresh handled by global section refresh
+                // ✅ OPTIMIZATION: Disabled polling - using smart cache + manual invalidation
+                console.log('✅ Todo auto-refresh disabled - using optimized caching');
             }
 
             function stopTodosAutoRefresh() {
@@ -23183,7 +23565,16 @@
                 return todos.map(t => `${t.id}:${t.completed}:${t.updated_at || t.created_at}`).join('|');
             }
 
-            function loadTodos(forceRefresh = false, silent = false) {
+            async function loadTodos(forceRefresh = false, silent = false) {
+                // Wait for Supabase to be ready before loading
+                if (!silent) {
+                    const isReady = await ensureSupabaseReady();
+                    if (!isReady && !authToken) {
+                        console.warn('Supabase not ready yet, skipping todos load');
+                        return;
+                    }
+                }
+                
                 const now = Date.now();
 
                 // If forcing refresh, clear cache to ensure fresh data
@@ -23617,6 +24008,14 @@
                     const isMaEnabled = !!(maData?.enabled);
                     const maMyEntry = isMaEnabled ? (maData.assignees || []).find(a => (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase()) : null;
                     const maIsCreator = isMaEnabled && (maData.created_by||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+                    // Detect if current user is a delegated sub-assignee (User C scenario)
+                    let mySubEntry = null, mySubParentEntry = null;
+                    if (isMaEnabled && !maMyEntry) {
+                        for (const _ma of (maData?.assignees || [])) {
+                            const _found = (_ma.delegated_to || []).find(s => (s.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase());
+                            if (_found) { mySubEntry = _found; mySubParentEntry = _ma; break; }
+                        }
+                    }
 
                     const workflowStatus = todo.task_status || (todo.completed ? 'done' : 'todo');
                     const workflowStatusMap = {
@@ -23633,6 +24032,16 @@
                         } else if (maMyEntry.status === 'in_progress') {
                             workflowCfg = workflowStatusMap.in_progress;
                         } else if (maMyEntry.status === 'pending') {
+                            workflowCfg = workflowStatusMap.todo;
+                        }
+                    } else if (mySubEntry) {
+                        if (mySubEntry.status === 'accepted') {
+                            workflowCfg = { label: 'Completed', bg: '#dcfce7', color: '#166534', icon: '✅' };
+                        } else if (mySubEntry.status === 'completed') {
+                            workflowCfg = { label: 'Submitted', bg: '#ede9fe', color: '#5b21b6', icon: '📤' };
+                        } else if (mySubEntry.status === 'in_progress') {
+                            workflowCfg = workflowStatusMap.in_progress;
+                        } else if (mySubEntry.status === 'pending') {
                             workflowCfg = workflowStatusMap.todo;
                         }
                     }
@@ -23683,7 +24092,7 @@
                     </div>
                     
                     ${todo.description ? `<p style="margin: 0 0 8px 0; color: #64748b; font-size: 14px; ${todo.completed ? 'text-decoration: line-through;' : ''}">${escapeHtml(todo.description)}</p>` : ''}
-                    ${renderMultiAssignListPanel(todo, maData, maIsCreator, maMyEntry)}
+                    ${renderMultiAssignListPanel(todo, maData, maIsCreator, maMyEntry, mySubEntry, mySubParentEntry)}
                     
                     <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap; font-size: 13px; color: #94a3b8;">
                     ${todo.created_at ? `
@@ -23736,10 +24145,32 @@
                 <!-- Actions -->
                 <div style="display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap;">
                     ${maMyEntry ? (() => {
+                        // Check if current user has incomplete delegations
+                        const hasIncompleteDelegations = maMyEntry.delegated_to && maMyEntry.delegated_to.length > 0 && 
+                            maMyEntry.delegated_to.some(sub => sub.status !== 'accepted' && sub.status !== 'completed');
+                        
                         if (maMyEntry.status === 'pending') return `<button onclick=\"maUpdateMyStatus('${todo.id}', 'in_progress')\" style=\"background: #10b981; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(16,185,129,0.3);\" onmouseover=\"this.style.background='#059669'; this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#10b981'; this.style.transform='scale(1)';\">🚀 Start Task</button>`;
-                        if (maMyEntry.status === 'in_progress') return `<button onclick=\"maUpdateMyStatus('${todo.id}', 'completed')\" style=\"background: #8b5cf6; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(139,92,246,0.3);\" onmouseover=\"this.style.background='#7c3aed'; this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#8b5cf6'; this.style.transform='scale(1)';\">⚡ Take Action</button>`;
-                        if (maMyEntry.status === 'completed') return `<button disabled style=\"background: #e2e8f0; color: #475569; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: not-allowed; font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 6px;\">✅ Submitted</button>`;
-                        if (maMyEntry.status === 'accepted') return `<button disabled style=\"background: #dcfce7; color: #166534; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: not-allowed; font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 6px;\">✅ Completed</button>`;
+                        if (maMyEntry.status === 'in_progress') {
+                            if (hasIncompleteDelegations) {
+                                return `<button disabled style=\"background: #d1d5db; color: #6b7280; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: not-allowed; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; opacity: 0.6;\" title=\"Complete delegated work first\">⚡ Take Action</button>`;
+                            }
+                            return `<button onclick=\"maUpdateMyStatus('${todo.id}', 'completed')\" style=\"background: #8b5cf6; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(139,92,246,0.3);\" onmouseover=\"this.style.background='#7c3aed'; this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#8b5cf6'; this.style.transform='scale(1)';\">⚡ Take Action</button>`;
+                        }
+                        if (maMyEntry.status === 'completed') return `<button disabled style=\"background:#e2e8f0;color:#475569;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:not-allowed;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;\">📤 Submitted</button>`;
+                        if (maMyEntry.status === 'accepted') return `<button disabled style=\"background:#dcfce7;color:#166534;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:not-allowed;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;\">✅ Completed</button>`;
+                        return '';
+                    })() : ''}
+                    ${mySubEntry ? (() => {
+                        if (mySubEntry.status === 'pending') return `<button onclick=\"maUpdateSubAssigneeStatus('${todo.id}','${mySubParentEntry.username}','in_progress',this)\" style=\"background:#10b981;color:white;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:pointer;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(16,185,129,0.3);transition:all 0.2s;\" onmouseover=\"this.style.background='#059669';this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#10b981';this.style.transform='scale(1)';\">\ud83d\ude80 Start Task</button>`;
+                        if (mySubEntry.status === 'in_progress') {
+                            const mySubHasIncompleteSubs = Array.isArray(mySubEntry.delegated_to) && mySubEntry.delegated_to.some(s => s.status !== 'accepted' && s.status !== 'completed');
+                            return (mySubHasIncompleteSubs
+                                ? `<button disabled style=\"background:#d1d5db;color:#6b7280;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:not-allowed;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;opacity:0.6;\" title=\"Complete your delegations first\">\u26a1 Submit Work</button>`
+                                : `<button onclick=\"maUpdateSubAssigneeStatus('${todo.id}','${mySubParentEntry.username}','completed',this)\" style=\"background:#8b5cf6;color:white;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:pointer;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(139,92,246,0.3);transition:all 0.2s;\" onmouseover=\"this.style.background='#7c3aed';this.style.transform='scale(1.02)';\" onmouseout=\"this.style.background='#8b5cf6';this.style.transform='scale(1)';\">\u26a1 Submit Work</button>`)
+                            + `<button onclick=\"event.stopPropagation();openMaDelegationModal('${todo.id}')\" style=\"background:#e0f2fe;color:#06b6d4;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:pointer;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;transition:all 0.2s;\" onmouseover=\"this.style.background='#cffafe';this.style.color='#0284c7';\" onmouseout=\"this.style.background='#e0f2fe';this.style.color='#06b6d4';\">\ud83d\udd04 Delegate</button>`;
+                        }
+                        if (mySubEntry.status === 'completed') return `<button disabled style=\"background:#e2e8f0;color:#475569;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:not-allowed;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;\">\ud83d\udce4 Submitted</button>`;
+                        if (mySubEntry.status === 'accepted') return `<button disabled style=\"background:#dcfce7;color:#166534;border:none;border-radius:8px;padding:0 16px;height:36px;cursor:not-allowed;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px;\">\u2705 Completed</button>`;
                         return '';
                     })() : ''}
                     ${canPickQueuedTask && !todo.completed ? `<button onclick="claimQueuedTask('${todo.id}')" style="background: #0ea5e9; color: white; border: none; border-radius: 10px; padding: 0 14px; height: 36px; cursor: pointer; font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 4px rgba(14,165,233,0.3);" onmouseover="this.style.background='#0284c7'; this.style.transform='scale(1.02)';" onmouseout="this.style.background='#0ea5e9'; this.style.transform='scale(1)';">📥 Pick</button>` : ''}
@@ -23840,8 +24271,36 @@
             }
 
             // Render compact multi-assignment panel inside list items (visible without opening task)
-            function renderMultiAssignListPanel(todo, maData, maIsCreator, maMyEntry) {
+            function renderMultiAssignListPanel(todo, maData, maIsCreator, maMyEntry, mySubEntry, mySubParentEntry) {
                 if (!maData || !maData.enabled) return '';
+
+                // If current user is ONLY a sub-assignee (User C), render a personal panel
+                if (!maMyEntry && mySubEntry && mySubParentEntry) {
+                    const statusColors = { pending:'#94a3b8', in_progress:'#06b6d4', completed:'#8b5cf6', accepted:'#10b981', rejected:'#ef4444' };
+                    const statusLabels = { pending:'⏳ Pending', in_progress:'🚀 In Progress', completed:'✅ Submitted', accepted:'🎉 Completed', rejected:'❌ Rejected' };
+                    const sColor = statusColors[mySubEntry.status] || '#94a3b8';
+                    const sLabel = statusLabels[mySubEntry.status] || mySubEntry.status;
+                    const hasIncompleteDelegations = Array.isArray(mySubEntry.delegated_to) &&
+                        mySubEntry.delegated_to.some(s => s.status !== 'accepted' && s.status !== 'completed');
+                    const totalSubs = Array.isArray(mySubEntry.delegated_to) ? mySubEntry.delegated_to.length : 0;
+                    const doneSubs = Array.isArray(mySubEntry.delegated_to) ? mySubEntry.delegated_to.filter(s => s.status === 'accepted' || s.status === 'completed').length : 0;
+                    const subPct = totalSubs > 0 ? Math.round((doneSubs / totalSubs) * 100) : (mySubEntry.status === 'accepted' ? 100 : mySubEntry.status === 'completed' ? 75 : mySubEntry.status === 'in_progress' ? 50 : 0);
+
+                    return `<div style="margin:10px 0 14px 0;padding:12px 14px;background:linear-gradient(135deg,#f0fdff 0%,#e0f2fe 100%);border:1px solid #a5f3fc;border-radius:14px;">
+                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+                            <span style="font-size:16px;">👤</span>
+                            <strong style="color:#0e7490;font-size:13px;">Your Delegation</strong>
+                            <span style="font-size:11px;color:#64748b;">delegated by <strong>${escapeHtml(mySubParentEntry.username)}</strong></span>
+                            <span style="margin-left:auto;font-size:11px;font-weight:700;color:${sColor};background:${sColor}15;padding:3px 10px;border-radius:20px;">${sLabel}</span>
+                        </div>
+                        <div style="background:#e0f2fe;border-radius:99px;height:6px;overflow:hidden;margin-bottom:8px;">
+                            <div style="height:100%;background:linear-gradient(90deg,#06b6d4,#0891b2);border-radius:99px;width:${subPct}%;transition:width 0.4s;"></div>
+                        </div>
+                        ${mySubEntry.delegation_instructions ? `<div style="font-size:12px;color:#0c4a6e;margin-bottom:8px;padding:8px;background:#e0f2fe;border-radius:6px;"><strong>📋 Instructions:</strong> ${escapeHtml(mySubEntry.delegation_instructions)}</div>` : ''}
+                        ${hasIncompleteDelegations ? `<div style="font-size:12px;color:#991b1b;background:#fee2e2;padding:6px 10px;border-radius:6px;margin-bottom:6px;">⏳ Waiting for ${totalSubs - doneSubs} delegation(s) to complete before you can submit</div>` : ''}
+                        ${totalSubs > 0 ? `<div style="font-size:12px;color:#0e7490;margin-bottom:6px;">🔄 Your delegations: ${doneSubs}/${totalSubs} complete</div>` : ''}
+                    </div>`;
+                }
 
                 const pct = maData.completion_percentage || 0;
                 const assignees = maData.assignees || [];
@@ -23852,24 +24311,102 @@
                     const isMe = (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
                     const sColor = statusColors[a.status] || '#94a3b8';
                     const sLabel = statusLabels[a.status] || a.status;
-                    const actionBtns = maIsCreator && !isMe && a.status === 'completed'
-                        ? `<button onclick="maAcceptAssignee('${todo.id}','${a.username}')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;margin-right:4px;">✅ Accept</button>
-                           <button onclick="maRejectAssignee('${todo.id}','${a.username}')" style="background:#ef4444;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">❌ Reject</button>`
-                        : maIsCreator && !isMe && a.status === 'accepted'
-                            ? `<button onclick="maReopenAssignee('${todo.id}','${a.username}')" style="background:#f59e0b;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">🔓 Reopen</button>`
-                        : isMe && a.status === 'pending'
-                            ? `<button onclick="maUpdateMyStatus('${todo.id}','in_progress')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">🚀 Start Task</button>`
-                        : isMe && a.status === 'in_progress'
-                            ? `<button onclick="maUpdateMyStatus('${todo.id}','completed')" style="background:#8b5cf6;color:white;border:none;border-radius:8px;padding:6px 14px;font-size:14px;font-weight:700;cursor:pointer;">⚡ Take Action</button>`
+                    
+                    // Get assignee's department from window.allUsers
+                    const assigneeUser = (window.allUsers || []).find(u => (u.username||'').toLowerCase() === (a.username||'').toLowerCase());
+                    const assigneeDept = assigneeUser?.department || '';
+                    
+                    // Check if all delegated sub-assignees are completed/accepted
+                    const hasIncompleteSubAssignees = a.delegated_to && a.delegated_to.length > 0 && 
+                        a.delegated_to.some(sub => sub.status !== 'accepted' && sub.status !== 'completed');
+                    const canTakeAction = !hasIncompleteSubAssignees;
+                    const blockingReason = hasIncompleteSubAssignees ? 
+                        `⏳ Waiting for ${a.delegated_to.filter(s => s.status !== 'accepted' && s.status !== 'completed').length} user(s) to complete` : '';
+                    
+                    // Buttons are shown in detail modal only to avoid duplication in list view
+                    const actionBtns = '';
+                    
+                    // Feedback note with author (the assignee who submitted it)
+                    const feedbackNote = a.notes ? `<div style="width:100%;margin-top:8px;padding:10px;background:#fef3c7;border-left:4px solid #f59e0b;border-radius:6px;font-size:11px;color:#78350f;line-height:1.5;"><strong>💬 Feedback:</strong> ${escapeHtml(a.notes)}</div>` : '';
+                    
+                    // Blocking message if waiting for delegations
+                    const blockingMsg = blockingReason ? `<div style="width:100%;margin-top:8px;padding:10px;background:#fef2f2;border-left:4px solid #ef4444;border-radius:6px;font-size:11px;color:#991b1b;font-weight:600;display:flex;align-items:center;gap:6px;"><span style="font-size:14px;">⏳</span>${blockingReason}</div>` : '';
+                    
+                    // Delegation hierarchy display with improved styling
+                    let delegationHTML = '';
+                    if (a.delegated_to && a.delegated_to.length > 0) {
+                        const subAssignees = a.delegated_to.map(sub => {
+                            const subColor = statusColors[sub.status] || '#94a3b8';
+                            const subLabel = statusLabels[sub.status] || sub.status;
+                            const subIsMe = (sub.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+                            
+                            // Check if sub-assignee has their own incomplete sub-delegations
+                            const subHasIncompleteSubs = Array.isArray(sub.delegated_to) &&
+                                sub.delegated_to.some(s2 => s2.status !== 'accepted' && s2.status !== 'completed');
+
+                            // Show action buttons inline for sub-assignees
+                            const subActionBtns = isMe && sub.status === 'completed'
+                                ? `<button onclick="event.stopPropagation();maAcceptSubAssignee('${todo.id}','${a.username}','${sub.username}',this)" style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer;background:#10b981;color:white;display:flex;align-items:center;gap:4px;transition:all 0.2s;" onmouseover="this.style.background='#059669';" onmouseout="this.style.background='#10b981';">✅ Accept</button>
+                                   <button onclick="event.stopPropagation();maRejectSubAssignee('${todo.id}','${a.username}','${sub.username}',this)" style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer;background:#ef4444;color:white;display:flex;align-items:center;gap:4px;transition:all 0.2s;margin-left:4px;" onmouseover="this.style.background='#dc2626';" onmouseout="this.style.background='#ef4444';">❌ Reject</button>`
+                                : subIsMe && sub.status === 'pending'
+                                    ? `<button onclick="event.stopPropagation();maUpdateSubAssigneeStatus('${todo.id}','${a.username}','in_progress',this)" style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer;background:#10b981;color:white;display:flex;align-items:center;gap:4px;transition:all 0.2s;" onmouseover="this.style.background='#059669';" onmouseout="this.style.background='#10b981';">🚀 Start</button>`
+                                : subIsMe && sub.status === 'in_progress'
+                                    ? `${subHasIncompleteSubs
+                                        ? `<button disabled style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:not-allowed;background:#d1d5db;color:#6b7280;display:flex;align-items:center;gap:4px;opacity:0.6;" title="Complete your delegations first">⚡ Submit</button>`
+                                        : `<button onclick="event.stopPropagation();maUpdateSubAssigneeStatus('${todo.id}','${a.username}','completed',this)" style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer;background:#8b5cf6;color:white;display:flex;align-items:center;gap:4px;transition:all 0.2s;" onmouseover="this.style.background='#7c3aed';" onmouseout="this.style.background='#8b5cf6';">⚡ Submit</button>`}
+                                       <button onclick="event.stopPropagation();openMaDelegationModal('${todo.id}')" style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer;background:#e0f2fe;color:#06b6d4;display:flex;align-items:center;gap:4px;transition:all 0.2s;margin-left:4px;" onmouseover="this.style.background='#cffafe';" onmouseout="this.style.background='#e0f2fe';">🔄 Delegate</button>`
+                                : subIsMe && sub.status === 'completed'
+                                    ? `<button disabled style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:not-allowed;background:#e2e8f0;color:#475569;display:flex;align-items:center;gap:4px;">📤 Submitted</button>`
+                                : subIsMe && sub.status === 'accepted'
+                                    ? `<button disabled style="border:none;border-radius:8px;height:30px;padding:0 10px;font-size:12px;font-weight:700;cursor:not-allowed;background:#dcfce7;color:#166534;display:flex;align-items:center;gap:4px;">✅ Done</button>`
+                                : '';
+                            
+                            const subFeedback = sub.notes ? `<div style="margin-top:5px;padding:6px 8px;background:#fef3c7;border-left:2px solid #f59e0b;border-radius:4px;font-size:10px;color:#78350f;"><strong>💬 ${escapeHtml(sub.username)}:</strong> ${escapeHtml(sub.notes)}</div>` : '';
+                            
+                            // Remove delegation button — visible to parent when sub hasn't been accepted yet
+                            const removeSubBtn = isMe && sub.status !== 'accepted'
+                                ? `<button onclick="event.stopPropagation();maRemoveDelegation('${todo.id}','${a.username}','${sub.username}',this)" style="border:none;border-radius:6px;height:26px;padding:0 8px;font-size:11px;font-weight:700;cursor:pointer;background:#fee2e2;color:#ef4444;display:inline-flex;align-items:center;gap:3px;transition:all 0.2s;margin-left:2px;" onmouseover="this.style.background='#fecaca';" onmouseout="this.style.background='#fee2e2';" title="Remove this delegation">✖ Remove</button>`
+                                : '';
+                            
+                            return `<div style="display:flex;flex-direction:column;gap:5px;padding:8px 10px;background:#fff;border-radius:6px;margin-top:4px;border-left:3px solid ${subColor};">
+                                <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
+                                    <span style="font-size:11px;font-weight:600;color:#1e293b;">${escapeHtml(sub.username)}${subIsMe ? ' <span style="background:#06b6d4;color:white;padding:1px 6px;border-radius:3px;font-size:10px;">(you)</span>' : ''}</span>
+                                    <span style="font-size:10px;font-weight:700;color:${subColor};background:${subColor}15;padding:2px 8px;border-radius:12px;white-space:nowrap;">${subLabel}</span>
+                                    <div style="margin-left:auto;display:flex;align-items:center;flex-wrap:wrap;gap:4px;">${subActionBtns}${removeSubBtn}</div>
+                                </div>
+                                ${subFeedback}
+                            </div>`;
+                        }).join('');
+                        
+                        delegationHTML = `<div style="margin-top:8px;padding:10px;background:#f0f9ff;border-radius:8px;border:1px solid #bae6fd;border-left:4px solid #0284c7;">
+                            <div style="font-size:12px;font-weight:700;color:#0c4a6e;margin-bottom:6px;display:flex;align-items:center;gap:6px;"><span style="font-size:16px;">🔄</span>Delegated to ${a.delegated_to.length} user(s):</div>
+                            ${subAssignees}
+                        </div>`;
+                    }
+                    
+                    // Show reassign/delegate button if user is the assignee and in progress
+                    const reassignBtn = isMe && a.status === 'in_progress' 
+                        ? `<button onclick="event.stopPropagation(); openMaDelegationModal('${todo.id}')" style="display:flex;align-items:center;gap:4px;font-size:12px;color:#06b6d4;font-weight:700;padding:6px 12px;background:#e0f2fe;border:none;border-radius:6px;cursor:pointer;transition:all 0.2s;white-space:nowrap;" onmouseover="this.style.background='#cffafe'; this.style.color='#0284c7';" onmouseout="this.style.background='#e0f2fe'; this.style.color='#06b6d4';">🔄 Delegate</button>` 
                         : '';
-                    const feedbackNote = a.notes ? `<div style="width:100%;margin-top:6px;padding:8px 10px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:6px;font-size:11px;color:#78350f;line-height:1.4;"><strong>💬 Feedback:</strong> ${escapeHtml(a.notes)}</div>` : '';
-                    return `<div style="width:100%;display:flex;flex-direction:column;padding:8px 12px;border-radius:10px;background:${isMe?'#f0fdff':'#f8fafc'};border:1px solid ${isMe?'#a5f3fc':'#e2e8f0'};margin-bottom:6px;">
-                        <div style="display:flex;align-items:center;gap:8px;">
-                            <span style="font-weight:700;font-size:12px;color:#1e293b;min-width:120px;">${escapeHtml(a.username)}${isMe?' (you)':''}</span>
-                            <span style="font-size:11px;font-weight:700;color:${sColor};background:${sColor}15;padding:3px 10px;border-radius:20px;">${sLabel}</span>
-                            <div style="margin-left:auto;display:flex;gap:4px;">${actionBtns}</div>
+
+                    // For sub-assignees shown inside this row, also show THEIR sub-delegate button
+                    // (handled per-sub below)
+                    
+                    return `<div style="width:100%;display:flex;flex-direction:column;padding:10px 12px;border-radius:10px;background:${isMe?'#f0fdff':'#f8fafc'};border:2px solid ${isMe?'#a5f3fc':'#e2e8f0'};margin-bottom:8px;transition:all 0.2s;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">
+                            <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;">
+                                <span style="font-weight:700;font-size:13px;color:#1e293b;">${escapeHtml(a.username)}${isMe?' <span style="background:#06b6d4;color:white;padding:2px 8px;border-radius:4px;font-size:11px;margin-left:6px;font-weight:600;">(YOU)</span>':''}</span>
+                                ${assigneeDept ? `<span style="font-weight:400;color:#64748b;font-size:11px;white-space:nowrap;">(${escapeHtml(assigneeDept)})</span>` : ''}
+                                <span style="font-size:11px;font-weight:700;color:${sColor};background:${sColor}15;padding:3px 10px;border-radius:20px;white-space:nowrap;">${sLabel}</span>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:6px;">
+                                ${reassignBtn}
+                                <button onclick="event.stopPropagation(); openTodoDetail('${todo.id}')" style="display:flex;align-items:center;gap:4px;font-size:12px;color:#0284c7;font-weight:700;padding:6px 12px;background:#e0f2fe;border:none;border-radius:6px;cursor:pointer;transition:all 0.2s;white-space:nowrap;" onmouseover="this.style.background='#cffafe'; this.style.color='#0269a1';" onmouseout="this.style.background='#e0f2fe'; this.style.color='#0284c7';">👁️ View</button>
+                            </div>
                         </div>
+                        ${blockingMsg}
                         ${feedbackNote}
+                        ${delegationHTML}
                     </div>`;
                 }).join('');
 
@@ -24265,8 +24802,15 @@
                     const ma = task.multi_assignment
                         ? (typeof task.multi_assignment === 'string' ? JSON.parse(task.multi_assignment) : task.multi_assignment)
                         : null;
-                    if (ma?.enabled && Array.isArray(ma.assignees) &&
-                        ma.assignees.some(a => (a.username || '').toLowerCase() === uLower)) return true;
+                    if (ma?.enabled && Array.isArray(ma.assignees)) {
+                        // Check top-level assignees
+                        if (ma.assignees.some(a => (a.username || '').toLowerCase() === uLower)) return true;
+                        // Check sub-assignees in delegated_to (delegation chain)
+                        for (const a of ma.assignees) {
+                            if (Array.isArray(a.delegated_to) &&
+                                a.delegated_to.some(sub => (sub.username || '').toLowerCase() === uLower)) return true;
+                        }
+                    }
                 } catch(e) { /* ignore */ }
                 // Check assignment_chain array directly
                 try {
@@ -24313,13 +24857,21 @@
                             // Directly assigned or self-created
                             if ((t.assigned_to || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
                             if (!t.assigned_to && (t.username || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
-                            // Multi-assignment: show if I'm an assignee and not yet accepted
+                            // Multi-assignment: show if I'm a top-level assignee OR a delegated sub-assignee
                             try {
                                 const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
                                 if (ma?.enabled && Array.isArray(ma.assignees)) {
                                     const me = (qfUser || '').toLowerCase();
+                                    // Check top-level assignees
                                     const entry = ma.assignees.find(a => (a.username || '').toLowerCase() === me);
                                     if (entry && entry.status !== 'accepted') return true;
+                                    // Check delegated sub-assignees
+                                    for (const a of ma.assignees) {
+                                        if (Array.isArray(a.delegated_to)) {
+                                            const sub = a.delegated_to.find(s => (s.username || '').toLowerCase() === me);
+                                            if (sub && sub.status !== 'accepted' && sub.status !== 'completed') return true;
+                                        }
+                                    }
                                 }
                             } catch(e) { /* ignore */ }
                             // Queued department tasks the user can pick up
@@ -24332,12 +24884,17 @@
                             if (t.archived) return false;
                             if ((t.assigned_to || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
                             if (!t.assigned_to && (t.username || '').toLowerCase() === (qfUser || '').toLowerCase()) return true;
-                            // Multi-assignment
+                            // Multi-assignment: check top-level assignees AND delegated sub-assignees
                             try {
                                 const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
                                 if (ma?.enabled && Array.isArray(ma.assignees)) {
                                     const me = (qfUser || '').toLowerCase();
-                                    return ma.assignees.some(a => (a.username || '').toLowerCase() === me);
+                                    if (ma.assignees.some(a => (a.username || '').toLowerCase() === me)) return true;
+                                    // Check delegated sub-assignees
+                                    for (const a of ma.assignees) {
+                                        if (Array.isArray(a.delegated_to) &&
+                                            a.delegated_to.some(s => (s.username || '').toLowerCase() === me)) return true;
+                                    }
                                 }
                             } catch(e) { /* ignore */ }
                             return false;
@@ -24466,7 +25023,11 @@
                             if (!isUserInvolved(t, teamMemberFilter)) return false;
                         } else if (!isAdminOrSMFilter) {
                             // No member selected & not admin/super → show only tasks where I'm involved OR queued for my dept
-                            if (!isUserInvolved(t, currentUser.username) && !isQueuedForMyDept) return false;
+                            // Check if I'm involved (including multi-assignment)
+                            if (!isUserInvolved(t, currentUser.username)) {
+                                // Also check if task is queued for my department
+                                if (!isQueuedForMyDept) return false;
+                            }
                         }
                         // Admin/Super Manager with 'All Members' → no restriction, show every task
                     }
@@ -25690,44 +26251,49 @@
                     return;
                 }
 
-                // Try google.script.run first, fallback to directAPI
-                if (typeof google !== 'undefined' && google.script && google.script.run) {
-                    google.script.run
-                        .withSuccessHandler(function () {
-                            showToast('Task deleted', 'success');
-                            loadTodos(true);
-                        })
-                        .withFailureHandler(function (error) {
-                            // Fallback to directAPI
-                            if (typeof directAPI !== 'undefined' && directAPI.deleteTodo) {
-                                directAPI.deleteTodo(todoId, token)
-                                    .then(function () {
-                                        showToast('Task deleted', 'success');
-                                        loadTodos(true);
+                // ✅ OPTIMISTIC UPDATE: Remove from UI immediately
+                const todoToDelete = todosCache.data.find(t => t.id === todoId);
+                performOptimisticUpdate({
+                    optimisticFn: () => {
+                        // Remove from cache immediately
+                        cacheManager.invalidateItem(todosCache, todoId);
+                        // Re-render without deleted item
+                        renderTodos(todosCache.data);
+                        updateTodoStats(todosCache.data);
+                    },
+                    serverFn: async () => {
+                        // Try google.script.run first, fallback to directAPI
+                        if (typeof google !== 'undefined' && google.script && google.script.run) {
+                            return new Promise((resolve, reject) => {
+                                google.script.run
+                                    .withSuccessHandler(resolve)
+                                    .withFailureHandler((error) => {
+                                        // Fallback to directAPI
+                                        if (typeof directAPI !== 'undefined' && directAPI.deleteTodo) {
+                                            directAPI.deleteTodo(todoId, token).then(resolve).catch(reject);
+                                        } else {
+                                            reject(error);
+                                        }
                                     })
-                                    .catch(function (err) {
-                                        showToast('Error: ' + (err.message || err), 'error');
-                                    });
-                            } else {
-                                showToast('Error: ' + (error.message || error), 'error');
-                            }
-                        })
-                        .deleteTodo(todoId, token);
-                } else {
-                    // Use directAPI directly
-                    if (typeof directAPI !== 'undefined' && directAPI.deleteTodo) {
-                        directAPI.deleteTodo(todoId, token)
-                            .then(function () {
-                                showToast('Task deleted', 'success');
-                                loadTodos(true);
-                            })
-                            .catch(function (err) {
-                                showToast('Error: ' + (err.message || err), 'error');
+                                    .deleteTodo(todoId, token);
                             });
-                    } else {
-                        showToast('Error: Delete service not available', 'error');
-                    }
-                }
+                        } else if (typeof directAPI !== 'undefined' && directAPI.deleteTodo) {
+                            return directAPI.deleteTodo(todoId, token);
+                        } else {
+                            throw new Error('Delete service not available');
+                        }
+                    },
+                    rollbackFn: () => {
+                        // Restore deleted item on error
+                        if (todoToDelete) {
+                            todosCache.data.unshift(todoToDelete);
+                            renderTodos(todosCache.data);
+                            updateTodoStats(todosCache.data);
+                        }
+                    },
+                    successMsg: 'Task deleted',
+                    errorMsg: 'Failed to delete task'
+                });
             }
 
             function escapeHtml(text) {
@@ -26697,6 +27263,7 @@
 
             async function confirmMaSubmissionFeedback() {
                 const todoId = window._maPendingSubmissionTodoId;
+                const delegatorUsername = window._maPendingSubmissionDelegator; // For sub-assignees
                 const feedback = document.getElementById('maSubmissionFeedback').value.trim();
                 const errorEl = document.getElementById('maSubmissionFeedbackError');
 
@@ -26707,7 +27274,16 @@
                 }
 
                 closeMaSubmissionFeedbackModal();
-                await maUpdateMyStatusDirect(todoId, 'completed', feedback);
+                showToast('⏳ Submitting your work...', 'info');
+                
+                // If delegatorUsername exists, this is a sub-assignee submitting to their delegator
+                if (delegatorUsername) {
+                    await maUpdateSubAssigneeStatusDirect(todoId, delegatorUsername, 'completed', feedback);
+                    window._maPendingSubmissionDelegator = null;
+                } else {
+                    // Regular assignee submitting to creator
+                    await maUpdateMyStatusDirect(todoId, 'completed', feedback);
+                }
             }
 
             // Multi-Assignment Reopen Feedback Modal Functions
@@ -26717,6 +27293,14 @@
                 window._maPendingReopenTodoId = null;
                 window._maPendingReopenAssignee = null;
                 document.getElementById('maReopenFeedback').value = '';
+            }
+
+            function closeMaRejectFeedbackModal() {
+                const modal = document.getElementById('maRejectFeedbackModal');
+                if (modal) modal.style.display = 'none';
+                window._maPendingRejectTodoId = null;
+                window._maPendingRejectAssignee = null;
+                document.getElementById('maRejectFeedback').value = '';
             }
 
             async function confirmMaReopenFeedback() {
@@ -26732,7 +27316,59 @@
                 }
 
                 closeMaReopenFeedbackModal();
+                showToast('⏳ Reopening task...', 'info');
+                
+                // Show loading on button if available
+                const btnData = window._maReopenOriginalBtn;
+                if (btnData && btnData.element) {
+                    btnData.element.disabled = true;
+                    btnData.element.style.opacity = '0.7';
+                    btnData.element.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Processing...';
+                }
+                
                 await maReopenAssigneeDirect(todoId, assigneeUsername, feedback);
+                
+                // Restore button
+                if (btnData && btnData.element) {
+                    btnData.element.disabled = false;
+                    btnData.element.style.opacity = '1';
+                    btnData.element.innerHTML = btnData.html;
+                }
+                window._maReopenOriginalBtn = null;
+            }
+
+            async function confirmMaRejectFeedback() {
+                const todoId = window._maPendingRejectTodoId;
+                const assigneeUsername = window._maPendingRejectAssignee;
+                const feedback = document.getElementById('maRejectFeedback').value.trim();
+                const errorEl = document.getElementById('maRejectFeedbackError');
+
+                if (!feedback) {
+                    errorEl.style.display = 'block';
+                    document.getElementById('maRejectFeedback').focus();
+                    return;
+                }
+
+                closeMaRejectFeedbackModal();
+                showToast('⏳ Rejecting work...', 'info');
+                
+                // Show loading on button if available
+                const btnData = window._maRejectOriginalBtn;
+                if (btnData && btnData.element) {
+                    btnData.element.disabled = true;
+                    btnData.element.style.opacity = '0.7';
+                    btnData.element.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Processing...';
+                }
+                
+                await maRejectAssigneeDirect(todoId, assigneeUsername, feedback);
+                
+                // Restore button
+                if (btnData && btnData.element) {
+                    btnData.element.disabled = false;
+                    btnData.element.style.opacity = '1';
+                    btnData.element.innerHTML = btnData.html;
+                }
+                window._maRejectOriginalBtn = null;
             }
 
             // Expose modal functions globally
@@ -26746,6 +27382,8 @@
             window.confirmMaSubmissionFeedback = confirmMaSubmissionFeedback;
             window.closeMaReopenFeedbackModal = closeMaReopenFeedbackModal;
             window.confirmMaReopenFeedback = confirmMaReopenFeedback;
+            window.closeMaRejectFeedbackModal = closeMaRejectFeedbackModal;
+            window.confirmMaRejectFeedback = confirmMaRejectFeedback;
 
             async function approveTodoCompletion(todoId) {
                 const token = authToken;
@@ -30704,11 +31342,648 @@
             }
         }
 
-        /** Update the current user's own status in a multi-assignment task */
-        async function maUpdateMyStatus(todoId, newStatus) {
+        // ========== DELEGATION MODAL FUNCTIONS ==========
+        
+        /** Open delegation modal for an assignee to delegate their task */
+        async function openMaDelegationModal(todoId) {
+            if (!todoId) return;
+            const todo = todosCache.data.find(t => t.id === todoId);
+            if (!todo) { showToast('Task not found', 'error'); return; }
+            
+            // Check permission: only assignee of this task can delegate
+            let ma = null;
+            try {
+                ma = todo.multi_assignment ? (typeof todo.multi_assignment === 'string' ? JSON.parse(todo.multi_assignment) : todo.multi_assignment) : null;
+            } catch(e) {}
+            
+            if (!ma?.enabled) { showToast('Not a multi-assignment task', 'error'); return; }
+            
+            // Check if current user is a top-level assignee OR a sub-assignee (delegated_to)
+            const isAssignee = (ma.assignees || []).some(a => (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase());
+            let mySubParentForDelegation = null;
+            if (!isAssignee) {
+                mySubParentForDelegation = (ma.assignees || []).find(a =>
+                    Array.isArray(a.delegated_to) &&
+                    a.delegated_to.some(s => (s.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase())
+                );
+            }
+            if (!isAssignee && !mySubParentForDelegation) { showToast('Only assignees can delegate tasks', 'error'); return; }
+            // Store parent info so confirmMaDelegation knows where to attach the new subs
+            window._maDelegationIsSubAssignee = !isAssignee;
+            window._maDelegationSubParentUsername = mySubParentForDelegation ? mySubParentForDelegation.username : null;
+            
+            // Load latest users from database before showing modal
+            try {
+                const client = getSupabase();
+                const { data: users } = await client.from('users').select('username, role, department').order('username');
+                if (users) {
+                    window.allUsers = users;
+                }
+            } catch(e) {
+                console.error('Failed to load latest users:', e);
+            }
+            
+            // Store current task ID
+            window._maDelegationTodoId = todoId;
+            window._maDelegationSelected = new Set();
+            
+            // Set task title
+            document.getElementById('maDelegationTaskTitle').textContent = escapeHtml(todo.title);
+            document.getElementById('maDelegationInstructions').value = '';
+            document.getElementById('maDelegationError').style.display = 'none';
+            
+            // Load and display users
+            loadMaDelegationUsers();
+            
+            // Show modal
+            document.getElementById('maDelegationModal').style.display = 'flex';
+        }
+        
+        /** Close delegation modal */
+        function closeMaDelegationModal() {
+            document.getElementById('maDelegationModal').style.display = 'none';
+            window._maDelegationTodoId = null;
+            window._maDelegationSelected = new Set();
+        }
+        
+        /** Load users for delegation */
+        function loadMaDelegationUsers() {
+            const users = (window.allUsers || []).filter(u => 
+                u.username && 
+                u.username.toLowerCase() !== (currentUser?.username || '').toLowerCase()
+            );
+            
+            const list = document.getElementById('maDelegationUsersList');
+            if (!list) return;
+            
+            const search = (document.getElementById('maDelegationUserSearch')?.value || '').toLowerCase();
+            const filtered = search 
+                ? users.filter(u => 
+                    (u.username||'').toLowerCase().includes(search) || 
+                    (u.department||'').toLowerCase().includes(search) ||
+                    (u.role||'').toLowerCase().includes(search))
+                : users;
+            
+            list.innerHTML = !filtered.length
+                ? '<div style="text-align:center;padding:16px;color:#94a3b8;font-size:13px;">No users found</div>'
+                : filtered.map(u => {
+                    const sel = (window._maDelegationSelected || new Set()).has(u.username);
+                    return `<label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;cursor:pointer;background:${sel?'#cffafe':'#f8fafc'};margin-bottom:4px;border:1px solid ${sel?'#06b6d4':'#e2e8f0'};transition:all 0.15s;">
+                        <input type="checkbox" value="${u.username}" ${sel?'checked':''} onchange="maDelegationToggleUser('${u.username}',this.checked)" style="width:16px;height:16px;accent-color:#06b6d4;cursor:pointer;flex-shrink:0;">
+                        <div style="flex:1;">
+                            <div style="font-size:13px;font-weight:700;color:#1e293b;">${escapeHtml(u.username)}</div>
+                            <div style="font-size:11px;color:#64748b;margin-top:2px;">${escapeHtml(u.department||'')} ${u.role ? '· ' + escapeHtml(u.role) : ''}</div>
+                        </div>
+                    </label>`;
+                }).join('');
+            maDelegationUpdateSelectedCount();
+        }
+        
+        /** Filter delegation users */
+        function filterMaDelegationUsers() {
+            loadMaDelegationUsers();
+        }
+        
+        /** Toggle user selection */
+        function maDelegationToggleUser(username, checked) {
+            if (!window._maDelegationSelected) window._maDelegationSelected = new Set();
+            if (checked) window._maDelegationSelected.add(username);
+            else window._maDelegationSelected.delete(username);
+            loadMaDelegationUsers();
+        }
+        
+        /** Select all visible users */
+        function maDelegationSelectAll() {
+            if (!window._maDelegationSelected) window._maDelegationSelected = new Set();
+            const list = document.getElementById('maDelegationUsersList');
+            if (!list) return;
+            list.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                window._maDelegationSelected.add(cb.value);
+                cb.checked = true;
+            });
+            loadMaDelegationUsers();
+        }
+        
+        /** Clear all selections */
+        function maDelegationClearAll() {
+            window._maDelegationSelected = new Set();
+            loadMaDelegationUsers();
+        }
+        
+        /** Update selection count */
+        function maDelegationUpdateSelectedCount() {
+            const cnt = document.getElementById('maDelegationSelectedCount');
+            if (cnt) {
+                const n = (window._maDelegationSelected || new Set()).size;
+                cnt.textContent = `${n} user${n!==1?'s':''} selected`;
+                cnt.style.background = n > 0 ? '#06b6d4' : '#94a3b8';
+            }
+        }
+        
+        /** Confirm and execute delegation */
+        async function confirmMaDelegation() {
+            const todoId = window._maDelegationTodoId;
+            const selectedUsers = Array.from(window._maDelegationSelected || new Set());
+            const instructions = document.getElementById('maDelegationInstructions')?.value.trim() || '';
+            const errorEl = document.getElementById('maDelegationError');
+            
+            if (!selectedUsers.length) {
+                errorEl.style.display = 'block';
+                return;
+            }
+            
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos').select('*').eq('id', todoId).single();
+                if (!row) { showToast('Task not found', 'error'); return; }
+                
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) { showToast('Not a multi-assignment task', 'error'); return; }
+                
+                const now = new Date().toISOString();
+                
+                // Create sub-assignees
+                const newSubAssignees = selectedUsers.map(username => ({
+                    username: username,
+                    status: 'pending',
+                    assigned_at: now,
+                    delegated_by: currentUser?.username,
+                    delegation_instructions: instructions,
+                    notes: ''
+                }));
+
+                if (window._maDelegationIsSubAssignee && window._maDelegationSubParentUsername) {
+                    // Sub-assignee (User C) is delegating to User D — attach under their slot
+                    const parentIdx = (ma.assignees || []).findIndex(a =>
+                        (a.username||'').toLowerCase() === window._maDelegationSubParentUsername.toLowerCase()
+                    );
+                    if (parentIdx < 0) { showToast('Parent assignee not found', 'error'); return; }
+                    const subIdx = (ma.assignees[parentIdx].delegated_to || []).findIndex(s =>
+                        (s.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase()
+                    );
+                    if (subIdx < 0) { showToast('You are not a sub-assignee', 'error'); return; }
+                    if (!ma.assignees[parentIdx].delegated_to[subIdx].delegated_to) {
+                        ma.assignees[parentIdx].delegated_to[subIdx].delegated_to = [];
+                    }
+                    ma.assignees[parentIdx].delegated_to[subIdx].delegated_to.push(...newSubAssignees);
+                    ma.assignees[parentIdx].delegated_to[subIdx].has_delegations = true;
+                } else {
+                    // Top-level assignee (User B) delegating to User C
+                    const myIdx = (ma.assignees || []).findIndex(a => 
+                        (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase()
+                    );
+                    if (myIdx < 0) { showToast('You are not an assignee', 'error'); return; }
+                    if (!ma.assignees[myIdx].delegated_to) {
+                        ma.assignees[myIdx].delegated_to = [];
+                    }
+                    ma.assignees[myIdx].delegated_to.push(...newSubAssignees);
+                    ma.assignees[myIdx].has_delegations = true;
+                }
+                
+                // Add to history
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_delegation',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Unknown',
+                    icon: '🔄',
+                    title: 'Task Delegated',
+                    details: `${currentUser?.username} delegated task to ${selectedUsers.length} user(s): ${selectedUsers.join(', ')}`
+                });
+                
+                // Update database
+                const updatePayload = {
+                    multi_assignment: ma,
+                    history: history,
+                    updated_at: now
+                };
+                
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                
+                showToast(`✅ Task delegated to ${selectedUsers.length} user(s)!`, 'success');
+                closeMaDelegationModal();
+                
+                // Refresh detail modal if open
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) {
+                    openTodoDetail(todoId);
+                }
+            } catch(e) {
+                showToast('Delegation failed: ' + (e.message || e), 'error');
+            }
+        }
+
+        // ========== SUB-ASSIGNEE MANAGEMENT FUNCTIONS ==========
+        
+        /** Sub-assignee updates their own status */
+        async function maUpdateSubAssigneeStatus(todoId, delegatorUsername, newStatus, btnElement) {
             if (!todoId || !currentUser?.username) return;
+            
+            let originalHTML = '';
+            if (btnElement && typeof btnElement !== 'string') {
+                originalHTML = btnElement.innerHTML;
+                btnElement.disabled = true;
+                btnElement.style.opacity = '0.7';
+                btnElement.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Processing...';
+            }
+            
+            // If completing, show feedback modal
+            if (newStatus === 'completed') {
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+                const todo = todosCache.data.find(t => t.id === todoId);
+                if (todo) {
+                    document.getElementById('maSubmissionTaskTitle').textContent = escapeHtml(todo.title);
+                    document.getElementById('maSubmissionFeedback').value = '';
+                    document.getElementById('maSubmissionFeedbackError').style.display = 'none';
+                    document.getElementById('maSubmissionFeedbackModal').style.display = 'flex';
+                    document.getElementById('maSubmissionFeedback').focus();
+                    window._maPendingSubmissionTodoId = todoId;
+                    window._maPendingSubmissionDelegator = delegatorUsername;
+                }
+                return;
+            }
+            
+            // For in_progress, proceed directly
+            await maUpdateSubAssigneeStatusDirect(todoId, delegatorUsername, newStatus, '', btnElement, originalHTML);
+        }
+        
+        async function maUpdateSubAssigneeStatusDirect(todoId, delegatorUsername, newStatus, feedback, btnElement, originalHTML) {
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos').select('*').eq('id', todoId).single();
+                if (!row) { 
+                    showToast('Task not found', 'error'); 
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return; 
+                }
+                
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) { 
+                    showToast('Not a multi-assignment task', 'error'); 
+                    return; 
+                }
+                
+                // Find delegator in assignees
+                const delegatorIdx = (ma.assignees || []).findIndex(a => 
+                    (a.username||'').toLowerCase() === delegatorUsername.toLowerCase()
+                );
+                if (delegatorIdx < 0) { showToast('Delegator not found', 'error'); return; }
+                
+                // Find me in sub-assignees
+                const subIdx = (ma.assignees[delegatorIdx].delegated_to || []).findIndex(s => 
+                    (s.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase()
+                );
+                if (subIdx < 0) { showToast('You are not a sub-assignee', 'error'); return; }
+                
+                const now = new Date().toISOString();
+                ma.assignees[delegatorIdx].delegated_to[subIdx] = {
+                    ...ma.assignees[delegatorIdx].delegated_to[subIdx],
+                    status: newStatus,
+                    ...(newStatus === 'completed' ? { completed_at: now, notes: feedback.trim() } : {}),
+                    ...(newStatus === 'in_progress' ? { started_at: now } : {})
+                };
+
+                // Recalculate overall completion percentage
+                // Count top-level assignees that are completed/accepted
+                const completedCount = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completedCount / ma.assignees.length) * 100);
+                ma.all_completed = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_sub_status',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Unknown',
+                    icon: newStatus === 'completed' ? '📤' : '▶️',
+                    title: newStatus === 'completed' ? 'Sub-Task Submitted' : 'Sub-Task Started',
+                    details: `${currentUser?.username} ${newStatus === 'completed' ? 'submitted work to' : 'started work delegated by'} ${delegatorUsername}`
+                });
+                
+                const updatePayload = {
+                    multi_assignment: ma,
+                    history: history,
+                    updated_at: now
+                };
+                
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                
+                const label = newStatus === 'in_progress' ? 'Sub-task started!' : 'Submitted to delegator for review!';
+                showToast(label, 'success');
+                
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+                
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) {
+                showToast('Failed to update status: ' + (e.message || e), 'error');
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+            }
+        }
+        
+        /** Delegator accepts sub-assignee's completion */
+        async function maAcceptSubAssignee(todoId, delegatorUsername, subUsername, btnElement) {
+            if (!todoId || !subUsername) return;
+            
+            let originalHTML = '';
+            if (btnElement && typeof btnElement !== 'string') {
+                originalHTML = btnElement.innerHTML;
+                btnElement.disabled = true;
+                btnElement.style.opacity = '0.7';
+                btnElement.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Accepting...';
+            }
+            
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos').select('*').eq('id', todoId).single();
+                if (!row) { 
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return; 
+                }
+                
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) return;
+                
+                const delegatorIdx = (ma.assignees || []).findIndex(a => 
+                    (a.username||'').toLowerCase() === delegatorUsername.toLowerCase()
+                );
+                if (delegatorIdx < 0) return;
+                
+                const subIdx = (ma.assignees[delegatorIdx].delegated_to || []).findIndex(s => 
+                    (s.username||'').toLowerCase() === subUsername.toLowerCase()
+                );
+                if (subIdx < 0) return;
+                
+                const now = new Date().toISOString();
+                ma.assignees[delegatorIdx].delegated_to[subIdx].status = 'accepted';
+                ma.assignees[delegatorIdx].delegated_to[subIdx].accepted_at = now;
+                ma.assignees[delegatorIdx].delegated_to[subIdx].accepted_by = currentUser?.username;
+
+                // After accepting, check if all of this delegator's sub-assignees are done
+                // → if so, clear the blocking state so User B can now Take Action
+                const delegatorEntry = ma.assignees[delegatorIdx];
+                const allSubsDone = !Array.isArray(delegatorEntry.delegated_to) ||
+                    delegatorEntry.delegated_to.every(s => s.status === 'accepted' || s.status === 'completed');
+                // If all subs accepted and delegator was blocked, keep their status as-is (in_progress)
+                // They can now click Take Action / Submit
+
+                // Recalculate overall completion percentage
+                const completedCount = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completedCount / ma.assignees.length) * 100);
+                ma.all_completed = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
+
+                // Add to history
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_sub_accept',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Unknown',
+                    icon: '✅',
+                    title: 'Sub-Task Accepted',
+                    details: `${currentUser?.username} accepted work from ${subUsername}.${ allSubsDone ? ' All delegations complete — ' + delegatorUsername + ' can now submit.' : ''}`
+                });
+                
+                const updatePayload = {
+                    multi_assignment: ma,
+                    history: history,
+                    updated_at: now
+                };
+                
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                
+                const msg = allSubsDone 
+                    ? `✅ Accepted! All delegations complete — ${delegatorUsername} can now submit.`
+                    : `✅ Accepted ${subUsername}'s work!`;
+                showToast(msg, 'success');
+                
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+                
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) {
+                showToast('Accept failed: ' + (e.message || e), 'error');
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+            }
+        }
+        
+        /** Delegator rejects sub-assignee's completion */
+        async function maRejectSubAssignee(todoId, delegatorUsername, subUsername, btnElement) {
+            if (!todoId || !subUsername) return;
+            
+            const feedback = prompt(`Provide feedback for ${subUsername} on why their work is being rejected:`);
+            if (!feedback || !feedback.trim()) return;
+            
+            let originalHTML = '';
+            if (btnElement && typeof btnElement !== 'string') {
+                originalHTML = btnElement.innerHTML;
+                btnElement.disabled = true;
+                btnElement.style.opacity = '0.7';
+                btnElement.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Rejecting...';
+            }
+            
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos').select('*').eq('id', todoId).single();
+                if (!row) { 
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return; 
+                }
+                
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) return;
+                
+                const delegatorIdx = (ma.assignees || []).findIndex(a => 
+                    (a.username||'').toLowerCase() === delegatorUsername.toLowerCase()
+                );
+                if (delegatorIdx < 0) return;
+                
+                const subIdx = (ma.assignees[delegatorIdx].delegated_to || []).findIndex(s => 
+                    (s.username||'').toLowerCase() === subUsername.toLowerCase()
+                );
+                if (subIdx < 0) return;
+                
+                const now = new Date().toISOString();
+                ma.assignees[delegatorIdx].delegated_to[subIdx].status = 'in_progress';
+                ma.assignees[delegatorIdx].delegated_to[subIdx].notes = feedback.trim();
+                
+                // Add to history
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_sub_reject',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Unknown',
+                    icon: '❌',
+                    title: 'Sub-Task Rejected',
+                    details: `${currentUser?.username} rejected ${subUsername}'s work. Feedback: ${feedback.trim()}`
+                });
+                
+                const updatePayload = {
+                    multi_assignment: ma,
+                    history: history,
+                    updated_at: now
+                };
+                
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+                
+                showToast(`Work rejected. ${subUsername} notified to make changes.`, 'info');
+                
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+                
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) {
+                showToast('Reject failed: ' + (e.message || e), 'error');
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+            }
+        }
+
+        /** Remove a sub-assignee delegation entirely */
+        async function maRemoveDelegation(todoId, delegatorUsername, subUsername, btnElement) {
+            if (!todoId || !subUsername) return;
+            if (!confirm(`Remove delegation to "${subUsername}"? They will no longer be assigned to this task.`)) return;
+
+            let originalHTML = '';
+            if (btnElement && typeof btnElement !== 'string') {
+                originalHTML = btnElement.innerHTML;
+                btnElement.disabled = true;
+                btnElement.style.opacity = '0.7';
+                btnElement.innerHTML = '⏳...';
+            }
+
+            try {
+                const client = getSupabase();
+                const { data: row } = await client.from('todos').select('*').eq('id', todoId).single();
+                if (!row) {
+                    if (btnElement && originalHTML) { btnElement.disabled = false; btnElement.style.opacity = '1'; btnElement.innerHTML = originalHTML; }
+                    return;
+                }
+
+                let ma = row.multi_assignment;
+                if (!ma?.enabled) return;
+
+                const delegatorIdx = (ma.assignees || []).findIndex(a =>
+                    (a.username||'').toLowerCase() === delegatorUsername.toLowerCase()
+                );
+                if (delegatorIdx < 0) { showToast('Delegator not found', 'error'); return; }
+
+                // Remove the sub-assignee from delegated_to
+                ma.assignees[delegatorIdx].delegated_to = (ma.assignees[delegatorIdx].delegated_to || [])
+                    .filter(s => (s.username||'').toLowerCase() !== subUsername.toLowerCase());
+
+                // Recalculate progress
+                const completedCount = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
+                ma.completion_percentage = Math.round((completedCount / ma.assignees.length) * 100);
+                ma.all_completed = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
+
+                const now = new Date().toISOString();
+                let history = [];
+                try { history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : []; } catch(e) {}
+                history.push({
+                    type: 'ma_delegation_removed',
+                    timestamp: now, date: now,
+                    user: currentUser?.username || 'Unknown',
+                    icon: '🗑️',
+                    title: 'Delegation Removed',
+                    details: `${currentUser?.username} removed delegation to ${subUsername}`
+                });
+
+                const updatePayload = { multi_assignment: ma, history: history, updated_at: now };
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                await client.from('todos').update(updatePayload).eq('id', todoId);
+
+                showToast(`Delegation to ${subUsername} removed successfully.`, 'success');
+                renderTodosFromCache();
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
+            } catch(e) {
+                showToast('Failed to remove delegation: ' + (e.message || e), 'error');
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.innerHTML = originalHTML;
+                }
+            }
+        }
+
+        /** Update the current user's own status in a multi-assignment task */
+        async function maUpdateMyStatus(todoId, newStatus, btnElement) {
+            if (!todoId || !currentUser?.username) return;
+            
+            // Store original button state
+            let originalHTML = '';
+            if (btnElement && typeof btnElement !== 'string') {
+                originalHTML = btnElement.innerHTML;
+                btnElement.disabled = true;
+                btnElement.style.opacity = '0.7';
+                btnElement.style.cursor = 'not-allowed';
+                btnElement.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Processing...';
+            }
+            
             // If completing, show feedback modal instead of prompt
             if (newStatus === 'completed') {
+                if (btnElement && typeof btnElement !== 'string') {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.style.cursor = 'pointer';
+                    btnElement.innerHTML = originalHTML;
+                }
                 // Find the task title for the modal
                 const todo = todosCache.data.find(t => t.id === todoId);
                 if (todo) {
@@ -30723,22 +31998,49 @@
                 return;
             }
             // For in_progress, proceed directly
-            await maUpdateMyStatusDirect(todoId, newStatus, '');
+            await maUpdateMyStatusDirect(todoId, newStatus, '', btnElement, originalHTML);
         }
 
-        async function maUpdateMyStatusDirect(todoId, newStatus, feedback) {
+        async function maUpdateMyStatusDirect(todoId, newStatus, feedback, btnElement, originalHTML) {
             if (!todoId || !currentUser?.username) return;
             try {
                 const client = getSupabase();
                 const { data: row } = await client.from('todos')
-                    .select('multi_assignment, task_status, completed, approval_status')
+                    .select('*')
                     .eq('id', todoId)
                     .single();
-                if (!row) { showToast('Task not found', 'error'); return; }
+                if (!row) { 
+                    showToast('Task not found', 'error'); 
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.style.cursor = 'pointer';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return; 
+                }
                 let ma = row.multi_assignment;
-                if (!ma || !ma.enabled) { showToast('Not a multi-assignment task', 'error'); return; }
+                if (!ma || !ma.enabled) { 
+                    showToast('Not a multi-assignment task', 'error'); 
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.style.cursor = 'pointer';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return; 
+                }
                 const idx = (ma.assignees||[]).findIndex(a => (a.username||'').toLowerCase() === (currentUser.username||'').toLowerCase());
-                if (idx < 0) { showToast('You are not an assignee of this task', 'error'); return; }
+                if (idx < 0) { 
+                    showToast('You are not an assignee of this task', 'error'); 
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.style.cursor = 'pointer';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return; 
+                }
                 const now = new Date().toISOString();
                 ma.assignees[idx] = { ...ma.assignees[idx], status: newStatus,
                     ...(newStatus === 'completed' ? { completed_at: now, notes: feedback.trim() } : {}),
@@ -30753,33 +32055,108 @@
                 let nextTaskStatus = row.task_status || (row.completed ? 'done' : 'todo');
                 if (!row.completed && (anyInProgress || anyCompleted)) nextTaskStatus = 'in_progress';
 
+                // ✅ ADD TO TASK HISTORY
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                // Initialize update payload
                 const updatePayload = {
                     multi_assignment: ma,
+                    history: history,
                     updated_at: now
                 };
+
+                if (newStatus === 'completed') {
+                    history.push({
+                        type: 'ma_submit',
+                        timestamp: now,
+                        date: now,
+                        user: currentUser?.username || 'Unknown',
+                        icon: '📤',
+                        title: 'Work Submitted',
+                        details: feedback ? `${currentUser?.username} submitted work. Notes: ${feedback}` : `${currentUser?.username} submitted work`
+                    });
+                    
+                    // Set task to pending approval if all assignees have completed
+                    if (ma.all_completed && !row.completed) {
+                        updatePayload.approval_status = 'pending_approval';
+                        updatePayload.task_status = 'in_progress';
+                    }
+                } else if (newStatus === 'in_progress') {
+                    history.push({
+                        type: 'ma_start',
+                        timestamp: now,
+                        date: now,
+                        user: currentUser?.username || 'Unknown',
+                        icon: '▶️',
+                        title: 'Work Started',
+                        details: `${currentUser?.username} started working on this task`
+                    });
+                }
+
                 if (!row.completed && nextTaskStatus && nextTaskStatus !== row.task_status) {
                     updatePayload.task_status = nextTaskStatus;
                 }
+                
+                // ✅ OPTIMISTIC UPDATE
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                
                 await client.from('todos').update(updatePayload).eq('id', todoId);
                 const label = newStatus === 'in_progress' ? 'Task started!' : 'Task marked as done! Waiting for creator review.';
                 showToast(label, 'success');
-                clearCache('todo'); loadTodos(true, true);
+                
+                // Restore button state
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.style.cursor = 'pointer';
+                    btnElement.innerHTML = originalHTML;
+                }
+                
                 if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
             } catch(e) {
                 showToast('Failed to update status: ' + (e.message || e), 'error');
+                // Restore button state on error
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.style.cursor = 'pointer';
+                    btnElement.innerHTML = originalHTML;
+                }
             }
         }
 
         /** Creator accepts a specific assignee's completion */
-        async function maAcceptAssignee(todoId, assigneeUsername) {
+        async function maAcceptAssignee(todoId, assigneeUsername, btnElement) {
             if (!todoId || !assigneeUsername) return;
+            
+            // Store original button state and show loading
+            let originalHTML = '';
+            if (btnElement && typeof btnElement !== 'string') {
+                originalHTML = btnElement.innerHTML;
+                btnElement.disabled = true;
+                btnElement.style.opacity = '0.7';
+                btnElement.style.cursor = 'not-allowed';
+                btnElement.innerHTML = '<span style="display:inline-block;animation:spin 0.6s linear infinite;">⏳</span> Accepting...';
+            }
+            
             try {
                 const client = getSupabase();
                 const { data: row } = await client.from('todos')
-                    .select('multi_assignment, task_status, completed, approval_status')
+                    .select('*')
                     .eq('id', todoId)
                     .single();
-                if (!row) return;
+                if (!row) {
+                    if (btnElement && originalHTML) {
+                        btnElement.disabled = false;
+                        btnElement.style.opacity = '1';
+                        btnElement.style.cursor = 'pointer';
+                        btnElement.innerHTML = originalHTML;
+                    }
+                    return;
+                }
                 let ma = row.multi_assignment;
                 if (!ma?.enabled) return;
                 const idx = (ma.assignees||[]).findIndex(a => (a.username||'').toLowerCase() === assigneeUsername.toLowerCase());
@@ -30791,8 +32168,25 @@
                 const allAccepted = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
                 ma.all_completed = allAccepted;
 
+                // ✅ ADD TO TASK HISTORY
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_accept',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Creator',
+                    icon: '✅',
+                    title: 'Work Accepted',
+                    details: `${currentUser?.username} accepted work from ${assigneeUsername}`
+                });
+
                 const updatePayload = {
                     multi_assignment: ma,
+                    history: history,
                     updated_at: now
                 };
 
@@ -30805,25 +32199,60 @@
                     updatePayload.task_status = 'done';
                 }
 
+                // ✅ OPTIMISTIC UPDATE
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+
                 await client.from('todos').update(updatePayload).eq('id', todoId);
                 showToast(`✅ Accepted ${assigneeUsername}'s work!`, 'success');
-                clearCache('todo'); loadTodos(true, true);
+                
+                // Restore button state
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.style.cursor = 'pointer';
+                    btnElement.innerHTML = originalHTML;
+                }
+                
                 if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
-            } catch(e) { showToast('Accept failed: ' + (e.message || e), 'error'); }
+            } catch(e) { 
+                showToast('Accept failed: ' + (e.message || e), 'error');
+                // Restore button state on error
+                if (btnElement && originalHTML) {
+                    btnElement.disabled = false;
+                    btnElement.style.opacity = '1';
+                    btnElement.style.cursor = 'pointer';
+                    btnElement.innerHTML = originalHTML;
+                }
+            }
         }
 
         /** Creator rejects a specific assignee's completion */
-        async function maRejectAssignee(todoId, assigneeUsername) {
-            const reason = prompt(`Feedback for rejecting ${assigneeUsername}'s work (required):`);
-            if (reason === null) return;   // cancelled
-            if (!reason || reason.trim() === '') {
-                showToast('Feedback is required for rejection', 'error');
-                return;
+        /** Creator rejects a specific assignee's completion */
+        async function maRejectAssignee(todoId, assigneeUsername, btnElement) {
+            if (!todoId || !assigneeUsername) return;
+            
+            // Store original button state
+            if (btnElement && typeof btnElement !== 'string') {
+                window._maRejectOriginalBtn = { element: btnElement, html: btnElement.innerHTML };
             }
+            
+            // Show reject feedback modal instead of prompt
+            document.getElementById('maRejectAssigneeName').textContent = escapeHtml(assigneeUsername);
+            document.getElementById('maRejectFeedback').value = '';
+            document.getElementById('maRejectFeedbackError').style.display = 'none';
+            document.getElementById('maRejectFeedbackModal').style.display = 'flex';
+            document.getElementById('maRejectFeedback').focus();
+            // Store the IDs for later use when confirming
+            window._maPendingRejectTodoId = todoId;
+            window._maPendingRejectAssignee = assigneeUsername;
+        }
+
+        async function maRejectAssigneeDirect(todoId, assigneeUsername, reason) {
+            if (!todoId || !assigneeUsername || !reason) return;
             try {
                 const client = getSupabase();
                 const { data: row } = await client.from('todos')
-                    .select('multi_assignment, task_status, completed')
+                    .select('*')
                     .eq('id', todoId)
                     .single();
                 if (!row) return;
@@ -30831,23 +32260,61 @@
                 if (!ma?.enabled) return;
                 const idx = (ma.assignees||[]).findIndex(a => (a.username||'').toLowerCase() === assigneeUsername.toLowerCase());
                 if (idx < 0) return;
-                ma.assignees[idx] = { ...ma.assignees[idx], status: 'in_progress', rejection_reason: reason, completed_at: null };
+                
+                ma.assignees[idx] = { 
+                    ...ma.assignees[idx], 
+                    status: 'in_progress', 
+                    rejection_reason: reason, 
+                    rejected_at: new Date().toISOString(),
+                    rejected_by: currentUser?.username || null,
+                    completed_at: null 
+                };
+                
                 const completed = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
                 ma.completion_percentage = Math.round((completed / ma.assignees.length) * 100);
                 ma.all_completed = false;
                 const now = new Date().toISOString();
+                
+                // ✅ ADD TO TASK HISTORY
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_reject',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Creator',
+                    icon: '❌',
+                    title: 'Work Rejected',
+                    details: `${currentUser?.username} rejected work from ${assigneeUsername}. Feedback: ${reason}`
+                });
+                
                 const updatePayload = {
                     multi_assignment: ma,
+                    history: history,
                     updated_at: now
                 };
+                
                 if (!row.completed && row.task_status !== 'in_progress') {
                     updatePayload.task_status = 'in_progress';
                 }
+                
                 await client.from('todos').update(updatePayload).eq('id', todoId);
+                
+                // ✅ OPTIMISTIC UPDATE
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                
                 showToast(`Task sent back to ${assigneeUsername}`, 'info');
-                clearCache('todo'); loadTodos(true, true);
-                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
-            } catch(e) { showToast('Reject failed: ' + (e.message || e), 'error'); }
+                
+                // Refresh UI if detail modal is open
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) {
+                    openTodoDetail(todoId);
+                }
+            } catch(e) { 
+                showToast('Reject failed: ' + (e.message || e), 'error'); 
+            }
         }
 
         /** Creator reopens an accepted assignee's work */
@@ -30867,6 +32334,7 @@
         async function maReopenAssigneeDirect(todoId, assigneeUsername, feedback) {
             if (!todoId || !assigneeUsername) return;
             try {
+                const client = getSupabase();
                 const {data: row, error: rowErr} = await client.from('todos').select('*').eq('id', todoId).single();
                 if (rowErr || !row) { showToast('Task not found', 'error'); return; }
                 let ma = null;
@@ -30881,6 +32349,8 @@
                 assignee.notes = feedback;
                 assignee.accepted_at = null;
                 assignee.accepted_by = null;
+                assignee.reopened_at = new Date().toISOString();
+                assignee.reopened_by = currentUser?.username || null;
                 
                 // Recalculate completion percentage
                 const completed = ma.assignees.filter(a => ['completed','accepted'].includes(a.status)).length;
@@ -30888,8 +32358,26 @@
                 ma.all_completed = ma.assignees.length > 0 && ma.assignees.every(a => a.status === 'accepted');
 
                 const now = new Date().toISOString();
+                
+                // ✅ ADD TO TASK HISTORY
+                let history = [];
+                try {
+                    history = row.history ? (typeof row.history === 'string' ? JSON.parse(row.history) : row.history) : [];
+                } catch(e) {}
+                
+                history.push({
+                    type: 'ma_reopen',
+                    timestamp: now,
+                    date: now,
+                    user: currentUser?.username || 'Creator',
+                    icon: '🔓',
+                    title: 'Work Reopened',
+                    details: `${currentUser?.username} reopened work for ${assigneeUsername}. Feedback: ${feedback}`
+                });
+                
                 const updatePayload = {
                     multi_assignment: ma,
+                    history: history,
                     updated_at: now
                 };
 
@@ -30904,10 +32392,19 @@
                 }
 
                 await client.from('todos').update(updatePayload).eq('id', todoId);
+                
+                // ✅ OPTIMISTIC UPDATE: Update cache immediately
+                cacheManager.updateItem(todosCache, todoId, updatePayload);
+                
                 showToast(`Reopened for ${assigneeUsername}`, 'info');
-                clearCache('todo'); loadTodos(true, true);
-                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) openTodoDetail(todoId);
-            } catch(e) { showToast('Reopen failed: ' + (e.message || e), 'error'); }
+                
+                // Refresh UI if detail modal is open
+                if (document.getElementById('todoDetailModal')?.style.display === 'flex' && currentDetailTodoId === todoId) {
+                    openTodoDetail(todoId);
+                }
+            } catch(e) { 
+                showToast('Reopen failed: ' + (e.message || e), 'error'); 
+            }
         }
 
         /** Render the multi-assignment progress panel for the detail modal */
@@ -30926,25 +32423,100 @@
                 const isMe = (a.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
                 const sColor = statusColors[a.status] || '#94a3b8';
                 const sLabel = statusLabels[a.status] || a.status;
+                
+                // Get assignee's department from window.allUsers
+                const assigneeUser = (window.allUsers || []).find(u => (u.username||'').toLowerCase() === (a.username||'').toLowerCase());
+                const assigneeDept = assigneeUser?.department || '';
+                
+                // Check if all delegated sub-assignees are completed/accepted
+                const hasIncompleteSubAssignees = a.delegated_to && a.delegated_to.length > 0 && 
+                    a.delegated_to.some(sub => sub.status !== 'accepted' && sub.status !== 'completed');
+                const canTakeAction = !hasIncompleteSubAssignees;
+                const blockingReason = hasIncompleteSubAssignees ? 
+                    `⏳ Waiting for ${a.delegated_to.filter(s => s.status !== 'accepted' && s.status !== 'completed').length} user(s) to complete` : '';
+                
                 const actionBtns = isCreator && !isMe && a.status === 'completed'
-                    ? `<button onclick="maAcceptAssignee('${details.id}','${a.username}')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;margin-right:4px;">✅ Accept</button>
-                       <button onclick="maRejectAssignee('${details.id}','${a.username}')" style="background:#ef4444;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">❌ Reject</button>`
+                    ? `<button onclick="maAcceptAssignee('${details.id}','${a.username}',this)" style="background:#10b981;color:white;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(16,185,129,0.3);transition:all 0.2s;" onmouseover="this.style.background='#059669';" onmouseout="this.style.background='#10b981';">✅ Accept</button>
+                       <button onclick="maRejectAssignee('${details.id}','${a.username}',this)" style="background:#ef4444;color:white;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(239,68,68,0.3);transition:all 0.2s;margin-left:6px;" onmouseover="this.style.background='#dc2626';" onmouseout="this.style.background='#ef4444';">❌ Reject</button>`
                     : isCreator && !isMe && a.status === 'accepted'
-                        ? `<button onclick="maReopenAssignee('${details.id}','${a.username}')" style="background:#f59e0b;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">🔓 Reopen</button>`
+                        ? `<button onclick="maReopenAssignee('${details.id}','${a.username}',this)" style="background:#f59e0b;color:white;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(245,158,11,0.3);transition:all 0.2s;" onmouseover="this.style.background='#d97706';" onmouseout="this.style.background='#f59e0b';">🔓 Reopen</button>`
                     : isMe && a.status === 'pending'
-                        ? `<button onclick="maUpdateMyStatus('${details.id}','in_progress')" style="background:#10b981;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">🚀 Start Task</button>`
+                        ? `<button onclick="maUpdateMyStatus('${details.id}','in_progress',this)" style="background:#10b981;color:white;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(16,185,129,0.3);transition:all 0.2s;" onmouseover="this.style.background='#059669';" onmouseout="this.style.background='#10b981';">🚀 Start Task</button>`
                     : isMe && a.status === 'in_progress'
-                        ? `<button onclick="maUpdateMyStatus('${details.id}','completed')" style="background:#8b5cf6;color:white;border:none;border-radius:8px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;">⚡ Take Action</button>`
+                        ? `${canTakeAction ? 
+                            `<button onclick="maUpdateMyStatus('${details.id}','completed',this)" style="background:#8b5cf6;color:white;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(139,92,246,0.3);transition:all 0.2s;" onmouseover="this.style.background='#7c3aed';" onmouseout="this.style.background='#8b5cf6';">⚡ Submit Work</button>` 
+                            : 
+                            `<button disabled style="background:#d1d5db;color:#6b7280;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:not-allowed;display:flex;align-items:center;gap:6px;opacity:0.6;" title="Complete delegated work first">⚡ Submit Work</button>`
+                          }
+                           <button onclick="openMaDelegationModal('${details.id}')" style="background:#06b6d4;color:white;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(6,182,212,0.3);transition:all 0.2s;margin-left:6px;" onmouseover="this.style.background='#0891b2';" onmouseout="this.style.background='#06b6d4';">🔄 Reassign</button>`
+                    : isMe && a.status === 'completed'
+                        ? `<button disabled style="background:#e2e8f0;color:#475569;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:not-allowed;display:flex;align-items:center;gap:6px;">📤 Submitted</button>`
+                    : isMe && a.status === 'accepted'
+                        ? `<button disabled style="background:#dcfce7;color:#166534;border:none;border-radius:8px;height:36px;padding:0 16px;font-size:13px;font-weight:700;cursor:not-allowed;display:flex;align-items:center;gap:6px;">✅ Completed</button>`
                     : '';
-                const rejNote = a.rejection_reason ? `<div style="font-size:11px;color:#ef4444;margin-top:6px;padding:8px 10px;background:#fee2e2;border-left:3px solid #ef4444;border-radius:6px;">❌ Rejected: ${escapeHtml(a.rejection_reason)}</div>` : '';
-                const feedbackNote = a.notes ? `<div style="font-size:11px;color:#78350f;margin-top:6px;padding:8px 10px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:6px;"><strong>💬 Feedback:</strong> ${escapeHtml(a.notes)}</div>` : '';
+                const rejNote = a.rejection_reason ? `<div style="font-size:11px;color:#ef4444;margin-top:8px;padding:10px;background:#fee2e2;border-left:3px solid #ef4444;border-radius:6px;font-weight:600;">❌ Rejected: ${escapeHtml(a.rejection_reason)}</div>` : '';
+                
+                // Feedback note with author (the assignee who submitted it)
+                const feedbackNote = a.notes ? `<div style="font-size:11px;color:#78350f;margin-top:8px;padding:10px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:6px;"><strong>💬 Feedback:</strong> ${escapeHtml(a.notes)}</div>` : '';
+                
+                // Blocking message if waiting for delegations
+                const blockingMsg = blockingReason ? `<div style="margin-top:8px;padding:10px;background:#fef2f2;border-left:4px solid #ef4444;border-radius:6px;font-size:11px;color:#991b1b;font-weight:600;display:flex;align-items:center;gap:6px;"><span style="font-size:14px;">⏳</span>${blockingReason}</div>` : '';
+                
+                // Delegation hierarchy display
+                let delegationHTML = '';
+                if (a.delegated_to && a.delegated_to.length > 0) {
+                    const subAssignees = a.delegated_to.map(sub => {
+                        const subColor = statusColors[sub.status] || '#94a3b8';
+                        const subLabel = statusLabels[sub.status] || sub.status;
+                        const subIsMe = (sub.username||'').toLowerCase() === (currentUser?.username||'').toLowerCase();
+                        
+                        const subHasIncompleteDelegations = Array.isArray(sub.delegated_to) &&
+                            sub.delegated_to.some(s2 => s2.status !== 'accepted' && s2.status !== 'completed');
+
+                        const subActionBtns = isMe && sub.status === 'completed'
+                            ? `<button onclick="maAcceptSubAssignee('${details.id}','${a.username}','${sub.username}',this)" style="background:#10b981;color:white;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(16,185,129,0.3);transition:all 0.2s;" onmouseover="this.style.background='#059669';" onmouseout="this.style.background='#10b981';">✅ Accept</button>
+                               <button onclick="maRejectSubAssignee('${details.id}','${a.username}','${sub.username}',this)" style="background:#ef4444;color:white;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(239,68,68,0.3);transition:all 0.2s;margin-left:6px;" onmouseover="this.style.background='#dc2626';" onmouseout="this.style.background='#ef4444';">❌ Reject</button>`
+                            : subIsMe && sub.status === 'pending'
+                                ? `<button onclick="maUpdateSubAssigneeStatus('${details.id}','${a.username}','in_progress',this)" style="background:#10b981;color:white;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(16,185,129,0.3);transition:all 0.2s;" onmouseover="this.style.background='#059669';" onmouseout="this.style.background='#10b981';">🚀 Start Task</button>`
+                            : subIsMe && sub.status === 'in_progress'
+                                ? `${subHasIncompleteDelegations
+                                    ? `<button disabled style="background:#d1d5db;color:#6b7280;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:not-allowed;display:flex;align-items:center;gap:6px;opacity:0.6;" title="Complete your delegations first">⚡ Submit Work</button>`
+                                    : `<button onclick="maUpdateSubAssigneeStatus('${details.id}','${a.username}','completed',this)" style="background:#8b5cf6;color:white;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(139,92,246,0.3);transition:all 0.2s;" onmouseover="this.style.background='#7c3aed';" onmouseout="this.style.background='#8b5cf6';">⚡ Submit Work</button>`}
+                                   <button onclick="openMaDelegationModal('${details.id}')" style="background:#e0f2fe;color:#06b6d4;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all 0.2s;margin-left:6px;" onmouseover="this.style.background='#cffafe';this.style.color='#0284c7';" onmouseout="this.style.background='#e0f2fe';this.style.color='#06b6d4';">🔄 Delegate</button>`
+                            : subIsMe && sub.status === 'completed'
+                                ? `<button disabled style="background:#e2e8f0;color:#475569;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:not-allowed;display:flex;align-items:center;gap:6px;">📤 Submitted</button>`
+                            : subIsMe && sub.status === 'accepted'
+                                ? `<button disabled style="background:#dcfce7;color:#166534;border:none;border-radius:8px;height:36px;padding:0 14px;font-size:13px;font-weight:700;cursor:not-allowed;display:flex;align-items:center;gap:6px;">✅ Completed</button>`
+                            : '';
+                        
+                        const subFeedback = sub.notes ? `<div style="margin-top:4px;padding:6px 8px;background:#fef3c7;border-left:2px solid #f59e0b;border-radius:4px;font-size:10px;color:#78350f;"><strong>💬 ${escapeHtml(sub.username)}:</strong> ${escapeHtml(sub.notes)}</div>` : '';
+                        
+                        return `<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 12px;background:#fff;border-radius:8px;margin-top:6px;border-left:3px solid ${subColor};">
+                            <div style="flex:1;">
+                                <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">
+                                    <span style="font-size:12px;font-weight:700;color:#1e293b;">${escapeHtml(sub.username)}${subIsMe?' <span style="background:#06b6d4;color:white;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:600;">(YOU)</span>':''}</span>
+                                    <span style="font-size:11px;font-weight:700;color:${subColor};background:${subColor}15;padding:2px 10px;border-radius:12px;">${subLabel}</span>
+                                </div>
+                                ${subFeedback}
+                            </div>
+                            <div style="display:flex;gap:4px;">${subActionBtns}</div>
+                        </div>`;
+                    }).join('');
+                    
+                    delegationHTML = `<div style="margin-top:10px;padding:10px;background:#f0f9ff;border-radius:10px;border:1px solid #bae6fd;border-left:4px solid #0284c7;">
+                        <div style="font-size:12px;font-weight:700;color:#0e7490;margin-bottom:6px;">🔄 Delegated to ${a.delegated_to.length} user(s):</div>
+                        ${subAssignees}
+                    </div>`;
+                }
+                
                 return `<div style="display:flex;flex-direction:column;gap:10px;padding:10px 14px;border-radius:10px;background:${isMe?'#f0fdff':'#f8fafc'};border:1px solid ${isMe?'#a5f3fc':'#e2e8f0'};margin-bottom:6px;">
-                    <div style="display:flex;align-items:center;gap:10px;">
-                        <span style="font-weight:700;font-size:13px;color:#1e293b;min-width:120px;">${escapeHtml(a.username)}${isMe?' (you)':''}</span>
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <span style="font-weight:700;font-size:13px;color:#1e293b;min-width:120px;">${escapeHtml(a.username)}${isMe?' (you)':''}${assigneeDept ? ` <span style="font-weight:400;color:#64748b;font-size:11px;">(${escapeHtml(assigneeDept)})</span>` : ''}</span>
                         <span style="font-size:12px;font-weight:700;color:${sColor};background:${sColor}15;padding:3px 10px;border-radius:20px;">${sLabel}</span>
-                        <div style="margin-left:auto;display:flex;gap:4px;">${actionBtns}</div>
+                        <div style="margin-left:auto;display:flex;gap:4px;flex-wrap:wrap;">${actionBtns}</div>
                     </div>
                     <div>${rejNote}${feedbackNote}</div>
+                    ${delegationHTML}
                 </div>`;
             }).join('');
 

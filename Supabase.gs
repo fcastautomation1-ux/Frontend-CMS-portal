@@ -111,3 +111,93 @@ function FORCE_AUTHORIZE() {
   Logger.log('Done!');
 }
 
+/**
+ * Get Supabase configuration for client-side use
+ * Returns URL and anonymous key (safe to expose to frontend)
+ */
+function getSupabaseConfig() {
+  const url = String(PropertiesService.getScriptProperties().getProperty('SUPABASE_URL') || '').trim().replace(/\/$/, "");
+  const key = String(PropertiesService.getScriptProperties().getProperty('SUPABASE_KEY') || '').trim();
+  
+  if (!url || !key) {
+    throw new Error('Supabase configuration missing in Script Properties. Please set SUPABASE_URL and SUPABASE_KEY.');
+  }
+  
+  return {
+    url: url,
+    anonKey: key
+  };
+}
+
+/**
+ * Login function - validates username and password
+ * @param {string} username - Username to login
+ * @param {string} password - Password to verify
+ * @returns {Object} Login result with success status, token, and user data
+ */
+function login(username, password) {
+  try {
+    if (!username || !password) {
+      return { success: false, error: 'Username and password are required' };
+    }
+    
+    // Query users table
+    const endpoint = `users?username=eq.${encodeURIComponent(username)}&limit=1`;
+    const users = supabaseRequest(endpoint, 'GET');
+    
+    if (!users || users.length === 0) {
+      return { success: false, error: 'Invalid username or password' };
+    }
+    
+    const user = users[0];
+    
+    // Verify password (plain text comparison for now)
+    // Note: In production, you should use hashed passwords
+    if (user.password !== password) {
+      return { success: false, error: 'Invalid username or password' };
+    }
+    
+    // Update last login
+    try {
+      const now = new Date().toISOString();
+      supabaseUpdate('users', { last_login: now }, { username: username });
+    } catch (e) {
+      Logger.log('Failed to update last_login: ' + e.message);
+    }
+    
+    // Generate simple token (username:role:timestamp)
+    const token = Utilities.base64Encode(username + ':' + user.role + ':' + Date.now());
+    
+    // Parse allowed fields
+    const parseAllowed = (str, role, username) => {
+      if (!str || str.trim() === '' || str.trim() === 'null') return [];
+      if (role === 'Admin' || role === 'Super Manager' || username === 'admin') return ['all'];
+      return str.split(',').map(s => s.trim()).filter(s => s);
+    };
+    
+    // Return success with user data
+    return {
+      success: true,
+      token: token,
+      user: {
+        username: user.username,
+        role: user.role,
+        department: user.department || null,
+        email: user.email || '',
+        avatarData: user.avatar_data || null,
+        allowedAccounts: parseAllowed(user.allowed_accounts, user.role, user.username),
+        allowedCampaigns: parseAllowed(user.allowed_campaigns, user.role, user.username),
+        allowedDriveFolders: (user.allowed_drive_folders || '').split(',').map(s => s.trim()).filter(s => s),
+        allowedLookerReports: user.allowed_looker_reports || '',
+        moduleAccess: user.module_access || null,
+        team_members: user.team_members || null,
+        manager_id: user.manager_id || null
+      }
+    };
+    
+  } catch (error) {
+    Logger.log('Login error: ' + error.message);
+    return { success: false, error: 'Login failed: ' + error.message };
+  }
+}
+
