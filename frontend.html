@@ -9541,7 +9541,7 @@
         /* ============ Searchable Dropdown Styles ============ */
         .searchable-dropdown-wrapper {
             position: relative;
-            width: 70%;
+            width: 100%;
         }
 
         .searchable-dropdown-trigger {
@@ -9978,7 +9978,7 @@
         /* Team member select wrapper */
         .tm-select-wrap {
             width: auto;
-            min-width: 175px;
+            min-width: 300px;
             position: relative;
             display: inline-flex;
             align-items: center;
@@ -14588,10 +14588,6 @@
                     window.currentUser = currentUser; // CRITICAL: Set on window for global access
                     console.log('✅ Session restored for:', currentUser.username, 'window.currentUser set:', !!window.currentUser);
 
-                    // Immediate department refresh on portal reload/session restore
-                    // so department dropdowns are current without waiting for background intervals.
-                    try { refreshDepartmentsCache(true); } catch (e) { }
-
                     updateLoadingStatus('Connecting to database...', 30);
 
                     // Ensure direct Supabase config is correct before any directAPI calls.
@@ -16842,22 +16838,6 @@
 
                 if (!authToken) return;
 
-                // --- DEPARTMENTS: refresh immediately on login/refresh for ALL users ---
-                refreshDepartmentsCache(true);
-
-                globalRefreshIntervals.departments = setInterval(() => {
-                    if (!authToken) return;
-                    refreshDepartmentsCache(false, function (departments) {
-                        // Update departments table if section is active
-                        const activeSection = document.querySelector('.content-section.active');
-                        if (activeSection && activeSection.id === 'departmentsSection') {
-                            renderDepartmentsTable(departments);
-                            const badge = document.getElementById('departmentsCount');
-                            if (badge) badge.textContent = departments?.length || 0;
-                        }
-                    });
-                }, 20 * 1000); // 20 seconds
-
                 // --- ACCOUNTS: Refresh every 30 seconds for instant updates ---
                 globalRefreshIntervals.accounts = setInterval(() => {
                     if (!authToken) return;
@@ -16890,6 +16870,24 @@
                         if (!authToken) return;
                         loadRules(true);
                     }, 30 * 1000); // 30 seconds
+
+                    // --- DEPARTMENTS: Refresh every 20 seconds ---
+                    // Initialize cache immediately
+                    refreshDepartmentsCache(true);
+
+                    globalRefreshIntervals.departments = setInterval(() => {
+                        if (!authToken) return;
+                        // Always refresh cache in background to keep dropdowns updated
+                        refreshDepartmentsCache(false, function (departments) {
+                            // Update departments table if section is active
+                            const activeSection = document.querySelector('.content-section.active');
+                            if (activeSection && activeSection.id === 'departmentsSection') {
+                                renderDepartmentsTable(departments);
+                                const badge = document.getElementById('departmentsCount');
+                                if (badge) badge.textContent = departments?.length || 0;
+                            }
+                        });
+                    }, 20 * 1000); // 20 seconds
 
                     // --- TEAM: Refresh every 30 seconds for real-time task analytics ---
                     globalRefreshIntervals.team = setInterval(() => {
@@ -18776,9 +18774,6 @@
                             authToken = response.token;
                             currentUser = response.user;
                             syncCurrentUserToWindow(); // Sync to window for global access
-
-                            // Immediate department refresh on login (no delay)
-                            try { refreshDepartmentsCache(true); } catch (e) { }
 
                             // IMPORTANT: Defer any directAPI calls (validateToken/getTodos/notifications)
                             // until after we sync the Supabase URL/key from server Script Properties.
@@ -24133,7 +24128,6 @@
                 timestamp: 0
             };
             const DEPARTMENTS_CACHE_DURATION = 15 * 1000; // 15 seconds cache
-            let departmentsRefreshInFlight = null;
 
             // Global function to refresh departments cache and update all dropdowns
             function refreshDepartmentsCache(forceRefresh = false, callback = null) {
@@ -24152,59 +24146,22 @@
                     return [];
                 }
 
-                // De-duplicate concurrent refresh calls (many modules request this together on login/refresh)
-                if (departmentsRefreshInFlight) {
-                    if (callback) {
-                        departmentsRefreshInFlight.finally(() => callback(departmentsCache.data));
-                    }
-                    return departmentsCache.data;
-                }
+                google.script.run
+                    .withSuccessHandler(function (departments) {
+                        departmentsCache.data = departments || [];
+                        departmentsCache.timestamp = Date.now();
+                        cachedDepartments = departmentsCache.data;
 
-                const applyDepartmentsData = (departments) => {
-                    departmentsCache.data = departments || [];
-                    departmentsCache.timestamp = Date.now();
-                    cachedDepartments = departmentsCache.data;
-                    // Update all department dropdowns immediately
-                    refreshAllDepartmentDropdowns();
-                    if (callback) callback(departmentsCache.data);
-                };
+                        // Update all department dropdowns immediately
+                        refreshAllDepartmentDropdowns();
 
-                const fetchViaAppsScript = () => {
-                    google.script.run
-                        .withSuccessHandler(function (departments) {
-                            applyDepartmentsData(departments);
-                            departmentsRefreshInFlight = null;
-                        })
-                        .withFailureHandler(function (error) {
-                            console.error('Error refreshing departments cache:', error);
-                            if (callback) callback(departmentsCache.data); // Return cached data on error
-                            departmentsRefreshInFlight = null;
-                        })
-                        .getAllDepartments(token);
-                };
-
-                // Fast path: direct DB fetch (usually faster than Apps Script bridge)
-                departmentsRefreshInFlight = (async () => {
-                    try {
-                        const client = getSupabase();
-                        if (client) {
-                            const { data, error } = await client
-                                .from('departments')
-                                .select('id,name,description')
-                                .order('name', { ascending: true });
-                            if (!error && Array.isArray(data)) {
-                                applyDepartmentsData(data);
-                                departmentsRefreshInFlight = null;
-                                return;
-                            }
-                        }
-                    } catch (e) {
-                        // fall through to Apps Script fallback
-                    }
-                    fetchViaAppsScript();
-                })();
-
-                return departmentsCache.data;
+                        if (callback) callback(departmentsCache.data);
+                    })
+                    .withFailureHandler(function (error) {
+                        console.error('Error refreshing departments cache:', error);
+                        if (callback) callback(departmentsCache.data); // Return cached data on error
+                    })
+                    .getAllDepartments(token);
             }
 
             // Update all department dropdowns with cached data
