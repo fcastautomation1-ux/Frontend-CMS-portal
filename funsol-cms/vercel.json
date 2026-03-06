@@ -1,7 +1,15 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": ".next",
-  "env": {
-    "NEXTAUTH_URL": "@nextauth_url"
-  }
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        }
+      ]
+    }
+  ]
 }

@@ -62,16 +62,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           name: user.username,
           email: user.email || "",
           role: user.role,
-          department: user.department,
-          allowedAccounts: user.allowed_accounts,
-          allowedDriveFolders: user.allowed_drive_folders,
-          allowedCampaigns: user.allowed_campaigns,
-          allowedLookerReports: user.allowed_looker_reports,
-          driveAccessLevel: user.drive_access_level || "viewer",
-          avatarData: user.avatar_data,
-          moduleAccess: user.module_access,
-          managerId: user.manager_id,
-          teamMembers: user.team_members,
         };
       },
     }),
@@ -81,16 +71,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       if (user) {
         token.username = user.id;
         token.role = (user as any).role;
-        token.department = (user as any).department;
-        token.allowedAccounts = (user as any).allowedAccounts;
-        token.allowedDriveFolders = (user as any).allowedDriveFolders;
-        token.allowedCampaigns = (user as any).allowedCampaigns;
-        token.allowedLookerReports = (user as any).allowedLookerReports;
-        token.driveAccessLevel = (user as any).driveAccessLevel;
-        token.avatarData = (user as any).avatarData;
-        token.moduleAccess = (user as any).moduleAccess;
-        token.managerId = (user as any).managerId;
-        token.teamMembers = (user as any).teamMembers;
       }
       return token;
     },
@@ -98,16 +78,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       if (session.user) {
         (session.user as any).username = token.username;
         (session.user as any).role = token.role;
-        (session.user as any).department = token.department;
-        (session.user as any).allowedAccounts = token.allowedAccounts;
-        (session.user as any).allowedDriveFolders = token.allowedDriveFolders;
-        (session.user as any).allowedCampaigns = token.allowedCampaigns;
-        (session.user as any).allowedLookerReports = token.allowedLookerReports;
-        (session.user as any).driveAccessLevel = token.driveAccessLevel;
-        (session.user as any).avatarData = token.avatarData;
-        (session.user as any).moduleAccess = token.moduleAccess;
-        (session.user as any).managerId = token.managerId;
-        (session.user as any).teamMembers = token.teamMembers;
       }
       return session;
     },
