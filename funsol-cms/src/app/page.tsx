@@ -1,13 +1,6 @@
 import { redirect } from "next/navigation";
-import { auth } from "@/lib/auth";
 
-export default async function Home() {
-  const session = await auth();
-  
-  // If logged in, go to dashboard. Otherwise, go to login
-  if (session?.user) {
-    redirect("/dashboard");
-  } else {
-    redirect("/login");
-  }
+export default function Home() {
+  // Redirect to login - NextAuth will handle session check and redirect to dashboard if already logged in
+  redirect("/login");
 }
