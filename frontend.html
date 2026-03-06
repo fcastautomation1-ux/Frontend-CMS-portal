@@ -27990,8 +27990,21 @@
                         // Assigned By (qfUser) = tasks qfUser CREATED and assigned to someone else, not completed
                         todos = todos.filter(t => {
                             if (t.completed || t.archived) return false;
-                            return (t.username || '').toLowerCase() === (qfUser || '').toLowerCase() &&
-                                t.assigned_to && (t.assigned_to || '').toLowerCase() !== (qfUser || '').toLowerCase();
+                            const qfLower = (qfUser || '').toLowerCase();
+                            if ((t.username || '').toLowerCase() !== qfLower) return false;
+                            if (t.assigned_to && (t.assigned_to || '').toLowerCase() !== qfLower) return true;
+                            // Multi-assignment created by me and assigned/delegated to others
+                            try {
+                                const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                                if (ma?.enabled && Array.isArray(ma.assignees)) {
+                                    for (const a of ma.assignees) {
+                                        const aUser = (a.username || '').toLowerCase();
+                                        if (aUser && aUser !== qfLower) return true;
+                                        if (Array.isArray(a.delegated_to) && a.delegated_to.some(s => (s.username || '').toLowerCase() !== qfLower)) return true;
+                                    }
+                                }
+                            } catch (e) { /* ignore */ }
+                            return false;
                         });
                     } else if (activeQuickFilter === 'pending_approval' || activeQuickFilter === 'my_approval_pending') {
                         todos = todos.filter(t => {
@@ -28005,8 +28018,19 @@
                             if (t.approval_status !== 'pending_approval') return false;
                             const qfLower = (qfUser || '').toString().trim().toLowerCase();
                             if ((t.username || '').toString().trim().toLowerCase() === qfLower) return false;
-                            return (t.completed_by || '').toString().trim().toLowerCase() === qfLower ||
-                                (t.assigned_to || '').toString().trim().toLowerCase() === qfLower;
+                            if ((t.completed_by || '').toString().trim().toLowerCase() === qfLower) return true;
+                            if ((t.assigned_to || '').toString().trim().toLowerCase() === qfLower) return true;
+                            // Include MA assignees/delegates waiting for creator approval
+                            try {
+                                const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                                if (ma?.enabled && Array.isArray(ma.assignees)) {
+                                    if (ma.assignees.some(a => (a.username || '').toLowerCase() === qfLower)) return true;
+                                    for (const a of ma.assignees) {
+                                        if (Array.isArray(a.delegated_to) && a.delegated_to.some(s => (s.username || '').toLowerCase() === qfLower)) return true;
+                                    }
+                                }
+                            } catch (e) { /* ignore */ }
+                            return false;
                         });
                     }
                 }
@@ -28038,7 +28062,20 @@
                             if (t.archived) return false;
                             if (t.approval_status !== 'pending_approval') return false;
                             if ((t.username || '').toLowerCase() === (qfUser || '').toLowerCase()) return false;
-                            const involved = (t.completed_by === qfUser) || (t.assigned_to === qfUser);
+                            const qfLower = (qfUser || '').toString().trim().toLowerCase();
+                            let involved = (t.completed_by || '').toString().trim().toLowerCase() === qfLower ||
+                                (t.assigned_to || '').toString().trim().toLowerCase() === qfLower;
+                            if (!involved) {
+                                try {
+                                    const ma = t.multi_assignment ? (typeof t.multi_assignment === 'string' ? JSON.parse(t.multi_assignment) : t.multi_assignment) : null;
+                                    if (ma?.enabled && Array.isArray(ma.assignees)) {
+                                        involved = ma.assignees.some(a => (a.username || '').toLowerCase() === qfLower);
+                                        if (!involved) {
+                                            involved = ma.assignees.some(a => Array.isArray(a.delegated_to) && a.delegated_to.some(s => (s.username || '').toLowerCase() === qfLower));
+                                        }
+                                    }
+                                } catch (e) { /* ignore */ }
+                            }
                             if (!involved) return false;
                         } else if (smartList === 'today') {
                             if (!t.due_date) return false;
@@ -28139,11 +28176,17 @@
                         // Otherwise, show all tasks in the department (already filtered by department filter)
                     } else {
                         if (currentUser && managerFiltersVisible) {
+                            const quickFilterOwnsScope = (
+                                activeQuickFilter === 'team_pending' ||
+                                activeQuickFilter === 'pending_approval' ||
+                                activeQuickFilter === 'my_approval_pending' ||
+                                activeQuickFilter === 'other_approval_pending'
+                            );
                             if (teamMemberFilter !== 'all') {
                                 // A specific member is selected:
                                 // - All/My Tasks views => created + assigned
                                 // - Other views/status breakdown => assignment-centric
-                                const includeCreatedScope = !kpiMode && (
+                                const includeCreatedScope = !quickFilterOwnsScope && !kpiMode && (
                                     !activeQuickFilter ||
                                     activeQuickFilter === 'all' ||
                                     activeQuickFilter === 'my_all'
@@ -28153,9 +28196,9 @@
                                 } else {
                                     if (!isTaskAssignedToUser(t, teamMemberFilter)) return false;
                                 }
-                            } else if (!isAdminOrSMFilter) {
+                            } else if (!quickFilterOwnsScope && !isAdminOrSMFilter) {
                                 // No member selected & not admin/super → show only tasks where I'm involved OR queued for my dept
-                                const includeCreatedScope = !kpiMode && (
+                                const includeCreatedScope = !quickFilterOwnsScope && !kpiMode && (
                                     !activeQuickFilter ||
                                     activeQuickFilter === 'all' ||
                                     activeQuickFilter === 'my_all'
@@ -28543,8 +28586,16 @@
                 // Your Assigned Pending: tasks countUser CREATED and assigned to someone else, not completed
                 const teamPending = contextTodos.filter(t => {
                     if (t.completed || t.archived) return false;
-                    return (t.username || '').toLowerCase() === countUserLower &&
-                        t.assigned_to && (t.assigned_to || '').toLowerCase() !== countUserLower;
+                    if ((t.username || '').toLowerCase() !== countUserLower) return false;
+                    if (t.assigned_to && (t.assigned_to || '').toLowerCase() !== countUserLower) return true;
+                    const ma = _parseMaBadge(t);
+                    if (ma?.enabled && Array.isArray(ma.assignees)) {
+                        for (const a of ma.assignees) {
+                            if ((a.username || '').toLowerCase() !== countUserLower) return true;
+                            if (Array.isArray(a.delegated_to) && a.delegated_to.some(s => (s.username || '').toLowerCase() !== countUserLower)) return true;
+                        }
+                    }
+                    return false;
                 });
 
                 // "All Tasks" badge = KPI Total exactly — same engine, same filters, forceQF='all'
@@ -28553,7 +28604,8 @@
                 // My Approval Pending: tasks awaiting approval where I'm the creator (only creator can approve)
                 const myApprovalPending = contextTodos.filter(t => {
                     if (t.archived) return false;
-                    return t.approval_status === 'pending_approval' && t.username === countUser;
+                    return t.approval_status === 'pending_approval' &&
+                        (t.username || '').toString().trim().toLowerCase() === countUserLower;
                 });
 
                 // Other Approval Pending: tasks I completed (or I am the assignee) that are waiting for SOMEONE ELSE'S approval
@@ -28562,9 +28614,18 @@
                     if (t.approval_status !== 'pending_approval') return false;
                     const countUserL = (countUser || '').toString().trim().toLowerCase();
                     if ((t.username || '').toString().trim().toLowerCase() === countUserL) return false;
-                    const involved =
+                    let involved =
                         (t.completed_by || '').toString().trim().toLowerCase() === countUserL ||
                         (t.assigned_to || '').toString().trim().toLowerCase() === countUserL;
+                    if (!involved) {
+                        const ma = _parseMaBadge(t);
+                        if (ma?.enabled && Array.isArray(ma.assignees)) {
+                            involved = ma.assignees.some(a => (a.username || '').toLowerCase() === countUserL);
+                            if (!involved) {
+                                involved = ma.assignees.some(a => Array.isArray(a.delegated_to) && a.delegated_to.some(s => (s.username || '').toLowerCase() === countUserL));
+                            }
+                        }
+                    }
                     return involved;
                 });
 
@@ -31708,6 +31769,7 @@
 
                     // Get team members first
                     let teamMemberDepts = new Set();
+                    const teamMemberDeptDisplayByNorm = new Map();
                     if (currentUser && window.allUsers && window.allUsers.length > 0) {
                         const meLower = (currentUser.username || '').toLowerCase();
                         const myRow = (window.allUsers || []).find(u => (u.username || '').toLowerCase() === meLower);
@@ -31729,7 +31791,15 @@
                         // Get departments of team members
                         (window.allUsers || []).forEach(u => {
                             if (teamSet.has((u.username || '').toLowerCase()) && u.department) {
-                                teamMemberDepts.add((u.department || '').toString().trim());
+                                splitDepartmentValues(u.department).forEach(rawDept => {
+                                    const cleanDept = (rawDept || '').toString().trim();
+                                    const normDept = normalizeDepartmentName(cleanDept);
+                                    if (!normDept) return;
+                                    teamMemberDepts.add(normDept);
+                                    if (!teamMemberDeptDisplayByNorm.has(normDept)) {
+                                        teamMemberDeptDisplayByNorm.set(normDept, cleanDept);
+                                    }
+                                });
                             }
                         });
                     }
@@ -31741,12 +31811,28 @@
                         departmentsCache.data = depts;
                     }
 
-                    // Filter departments to only show those of team members
+                    // Filter departments to only show those of team members.
+                    // Use normalized matching and include user-derived departments
+                    // that may not yet exist in the departments table.
                     if (teamMemberDepts.size > 0) {
-                        depts = depts.filter(d => {
-                            const deptName = (d.name || d).toString().trim();
-                            return teamMemberDepts.has(deptName);
+                        const filteredByNorm = new Map();
+
+                        (depts || []).forEach(d => {
+                            const asObj = (typeof d === 'string') ? { name: d } : (d || {});
+                            const deptName = (asObj.name || d || '').toString().trim();
+                            const deptNorm = normalizeDepartmentName(deptName);
+                            if (!deptNorm || !teamMemberDepts.has(deptNorm)) return;
+                            if (!filteredByNorm.has(deptNorm)) {
+                                filteredByNorm.set(deptNorm, { ...asObj, name: deptName });
+                            }
                         });
+
+                        teamMemberDeptDisplayByNorm.forEach((displayName, deptNorm) => {
+                            if (!teamMemberDepts.has(deptNorm) || filteredByNorm.has(deptNorm)) return;
+                            filteredByNorm.set(deptNorm, { name: displayName });
+                        });
+
+                        depts = Array.from(filteredByNorm.values());
                     }
 
                     // Fetch queued task counts per department (best-effort)
@@ -32026,15 +32112,13 @@
                     });
 
                     const teamSet = new Set([...explicitMembers, ...reverseTeamMembers]);
-                    const deptNameLower = departmentName.toLowerCase().trim();
 
                     // Filter users based on role and department
                     const deptUsers = (allUsers || []).filter(u => {
                         if (!u.username || u.username.toLowerCase() === meLower) return false; // Don't show self
 
-                        // Support multiple departments (comma-separated)
-                        const userDepts = (u.department || '').toString().toLowerCase().split(',').map(d => d.trim()).filter(Boolean);
-                        const isInDept = userDepts.some(ud => ud === deptNameLower);
+                        // Support multi-department users + naming variants (normalized)
+                        const isInDept = userBelongsToDepartment(u, departmentName);
 
                         if (!isInDept) return false; // Must be in the department
 
