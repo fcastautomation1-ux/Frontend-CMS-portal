@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
   ArrowRightLeft,
@@ -66,6 +66,7 @@ type Todo = {
   decline_reason?: string | null;
   assignment_chain?: string | AssignmentChainEntry[] | null;
   history?: string | TaskHistoryEntry[] | null;
+  attachments?: string | null;
   created_at: string;
   updated_at: string | null;
 };
@@ -141,6 +142,17 @@ type TaskTemplate = {
 
 const FORM_DRAFT_KEY = "legacy_tasks_form_draft_v2";
 const TEMPLATE_KEY = "legacy_tasks_templates_v1";
+const KPI_OPTIONS = [
+  "Monitizations",
+  "Store Graphics",
+  "Creative Graphic",
+  "Andriod Vitls",
+  "Bugs",
+  "New Feature",
+  "SDK Updates",
+  "Data Analysis",
+  "Others",
+];
 
 function parseCsv(value: string | null | undefined): string[] {
   if (!value) return [];
@@ -256,6 +268,8 @@ export default function TasksPage() {
   const [templates, setTemplates] = useState<TaskTemplate[]>([]);
   const [templateName, setTemplateName] = useState("");
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
+  const [creationFiles, setCreationFiles] = useState<File[]>([]);
+  const ourGoalRef = useRef<HTMLDivElement>(null);
 
   const lowerMe = me.toLowerCase();
 
@@ -652,6 +666,22 @@ export default function TasksPage() {
       .map((u) => ({ value: u.username, label: `${u.username} (${u.role})` }));
   }, [users]);
 
+  const appOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((t) => {
+      if (t.app_name) set.add(t.app_name);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [tasks]);
+
+  const packageOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((t) => {
+      if (t.package_name) set.add(t.package_name);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [tasks]);
+
   useEffect(() => {
     if (!taskModalOpen) return;
     localStorage.setItem(FORM_DRAFT_KEY, JSON.stringify(form));
@@ -693,6 +723,7 @@ export default function TasksPage() {
 
   function openCreateModal() {
     setEditingTask(null);
+    setCreationFiles([]);
     setTaskModalOpen(true);
   }
 
@@ -714,7 +745,27 @@ export default function TasksPage() {
       queue_department: task.queue_department || "",
     });
     setEditingTask(task);
+    setCreationFiles([]);
     setTaskModalOpen(true);
+  }
+
+  function syncAppToPackage(appName: string) {
+    const matches = tasks.filter((t) => (t.app_name || "") === appName && !!t.package_name);
+    const unique = Array.from(new Set(matches.map((m) => m.package_name as string)));
+    setForm((p) => ({ ...p, app_name: appName, package_name: unique.length === 1 ? unique[0] : p.package_name }));
+  }
+
+  function syncPackageToApp(pkg: string) {
+    const matches = tasks.filter((t) => (t.package_name || "") === pkg && !!t.app_name);
+    const unique = Array.from(new Set(matches.map((m) => m.app_name as string)));
+    setForm((p) => ({ ...p, package_name: pkg, app_name: unique.length === 1 ? unique[0] : p.app_name }));
+  }
+
+  function formatOurGoal(command: "bold" | "italic" | "underline" | "insertUnorderedList" | "insertOrderedList") {
+    if (!ourGoalRef.current) return;
+    ourGoalRef.current.focus();
+    document.execCommand(command);
+    setForm((p) => ({ ...p, our_goal: ourGoalRef.current?.innerHTML || "" }));
   }
 
   async function refreshTasks() {
@@ -736,6 +787,11 @@ export default function TasksPage() {
       return;
     }
 
+    if (form.title.trim().length < 3 || form.title.trim().length > 30) {
+      alert("Subject must be between 3 and 30 characters");
+      return;
+    }
+
     if (!form.due_date) {
       alert("Due date is required");
       return;
@@ -744,6 +800,11 @@ export default function TasksPage() {
     const due = new Date(form.due_date);
     if (Number.isNaN(due.getTime())) {
       alert("Please enter a valid due date");
+      return;
+    }
+
+    if (due.getTime() < Date.now()) {
+      alert("Due date must be in the future");
       return;
     }
 
@@ -757,6 +818,9 @@ export default function TasksPage() {
       app_name: form.app_name.trim() || null,
       package_name: form.package_name.trim() || null,
       kpi_type: form.kpi_type.trim() || null,
+      attachments: creationFiles.length > 0
+        ? JSON.stringify(creationFiles.map((f) => ({ name: f.name, size: f.size, type: f.type })))
+        : null,
       username: me,
       status: "open",
       task_status: "backlog",
@@ -1766,7 +1830,39 @@ export default function TasksPage() {
         size="xl"
       >
         <div className="grid gap-3 md:grid-cols-2">
-          <Input label="Task Subject" value={form.title} onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))} />
+          <Select
+            label="App / Game Name"
+            value={form.app_name}
+            onChange={(e) => syncAppToPackage(e.target.value)}
+            options={[{ value: "", label: "-- Select App / Game --" }, ...appOptions.map((v) => ({ value: v, label: v }))]}
+          />
+          <Select
+            label="Package Name"
+            value={form.package_name}
+            onChange={(e) => syncPackageToApp(e.target.value)}
+            options={[{ value: "", label: "-- Select Package --" }, ...packageOptions.map((v) => ({ value: v, label: v }))]}
+          />
+
+          <Select
+            label="KPI's"
+            value={form.kpi_type}
+            onChange={(e) => setForm((p) => ({ ...p, kpi_type: e.target.value }))}
+            options={[{ value: "", label: "-- Select KPI --" }, ...KPI_OPTIONS.map((k) => ({ value: k, label: k }))]}
+          />
+
+          <div className="rounded border border-gray-200 p-2 text-xs dark:border-gray-700">
+            <p className="font-semibold text-gray-600 dark:text-gray-300">Subject Count</p>
+            <p className={`${form.title.length > 30 || form.title.length < 3 ? "text-red-600" : "text-gray-600"}`}>{form.title.length}/30</p>
+          </div>
+
+          <Input
+            label="Subject"
+            maxLength={30}
+            value={form.title}
+            onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))}
+            placeholder="What needs to be done?"
+          />
+
           <Select
             label="Priority"
             value={form.priority}
@@ -1783,18 +1879,64 @@ export default function TasksPage() {
             <Input label="Description" value={form.description} onChange={(e) => setForm((p) => ({ ...p, description: e.target.value }))} />
           </div>
 
-          <div className="md:col-span-2">
-            <Input label="Our Goal" value={form.our_goal} onChange={(e) => setForm((p) => ({ ...p, our_goal: e.target.value }))} />
+          <div className="md:col-span-2 rounded border border-gray-200 dark:border-gray-700">
+            <div className="flex flex-wrap gap-2 border-b border-gray-200 p-2 dark:border-gray-700">
+              <Button type="button" size="sm" variant="outline" onClick={() => formatOurGoal("bold")}>B</Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => formatOurGoal("italic")}><i>I</i></Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => formatOurGoal("underline")}><u>U</u></Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => formatOurGoal("insertUnorderedList")}>• List</Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => formatOurGoal("insertOrderedList")}>1. List</Button>
+            </div>
+            <div
+              ref={ourGoalRef}
+              contentEditable
+              className="min-h-[120px] p-3 text-sm text-gray-900 outline-none dark:text-gray-100"
+              onInput={(e) => setForm((p) => ({ ...p, our_goal: (e.currentTarget as HTMLDivElement).innerHTML }))}
+              dangerouslySetInnerHTML={{ __html: form.our_goal || "" }}
+            />
           </div>
 
           <Input label="Due Date" type="datetime-local" value={form.due_date} onChange={(e) => setForm((p) => ({ ...p, due_date: e.target.value }))} />
-          <Input label="KPI" value={form.kpi_type} onChange={(e) => setForm((p) => ({ ...p, kpi_type: e.target.value }))} />
-
-          <Input label="App Name" value={form.app_name} onChange={(e) => setForm((p) => ({ ...p, app_name: e.target.value }))} />
-          <Input label="Package" value={form.package_name} onChange={(e) => setForm((p) => ({ ...p, package_name: e.target.value }))} />
+          <div className="rounded border border-gray-200 p-2 text-xs dark:border-gray-700">
+            <p className="font-semibold text-gray-600 dark:text-gray-300">Due Date Rule</p>
+            <p className="text-gray-500">Must be future date/time.</p>
+          </div>
 
           <div className="md:col-span-2">
             <Input label="Notes" value={form.notes} onChange={(e) => setForm((p) => ({ ...p, notes: e.target.value }))} />
+          </div>
+
+          <div className="md:col-span-2 rounded border border-gray-200 p-3 dark:border-gray-700">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-sm font-semibold text-gray-700 dark:text-gray-200">Attachments (Optional)</p>
+              <label className="cursor-pointer text-xs font-semibold text-primary-600 dark:text-primary-300">
+                + Add Files
+                <input
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files || []);
+                    setCreationFiles((prev) => [...prev, ...files]);
+                  }}
+                />
+              </label>
+            </div>
+            {creationFiles.length === 0 && <p className="text-xs text-gray-500">No files selected.</p>}
+            <div className="space-y-1">
+              {creationFiles.map((file, idx) => (
+                <div key={`${file.name}-${idx}`} className="flex items-center justify-between rounded border border-gray-200 px-2 py-1 text-xs dark:border-gray-700">
+                  <span>{file.name} ({Math.ceil(file.size / 1024)} KB)</span>
+                  <button
+                    type="button"
+                    className="text-red-600"
+                    onClick={() => setCreationFiles((prev) => prev.filter((_, i) => i !== idx))}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
 
@@ -1951,6 +2093,21 @@ export default function TasksPage() {
                     <span>{entry.details}</span>
                     <span className="mx-1">•</span>
                     <span className="text-gray-500">{formatDate(entry.timestamp)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+              <p className="mb-2 font-semibold">Attachments</p>
+              {parseJsonArray<{ name?: string; size?: number; type?: string }>(detailTask.attachments || null).length === 0 && (
+                <p className="text-gray-500">No attachments.</p>
+              )}
+              <div className="space-y-1">
+                {parseJsonArray<{ name?: string; size?: number; type?: string }>(detailTask.attachments || null).map((att, idx) => (
+                  <div key={`${att.name || "file"}-${idx}`} className="flex items-center justify-between rounded border border-gray-200 px-2 py-1 text-xs dark:border-gray-700">
+                    <span>{att.name || "file"}</span>
+                    <span className="text-gray-500">{att.size ? `${Math.ceil(att.size / 1024)} KB` : ""}</span>
                   </div>
                 ))}
               </div>
