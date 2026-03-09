@@ -3,15 +3,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
+  ArrowRightLeft,
   CalendarDays,
   CheckCircle2,
   Clock3,
+  CornerDownRight,
   Columns3,
   Download,
   Eye,
   Filter,
+  ListFilter,
   Kanban,
   ListTodo,
+  MessageSquare,
   Pencil,
   Plus,
   Send,
@@ -59,8 +63,25 @@ type Todo = {
   archived: boolean | null;
   queue_department: string | null;
   queue_status: "queued" | "claimed" | "completed" | null;
+  decline_reason?: string | null;
+  assignment_chain?: string | AssignmentChainEntry[] | null;
+  history?: string | TaskHistoryEntry[] | null;
   created_at: string;
   updated_at: string | null;
+};
+
+type AssignmentChainEntry = {
+  username: string;
+  role?: string;
+  status?: string;
+  message?: string;
+  timestamp?: string;
+};
+
+type TaskHistoryEntry = {
+  user: string;
+  details: string;
+  timestamp: string;
 };
 
 type TodoShare = {
@@ -79,6 +100,8 @@ type QuickFilter =
   | "approval_all";
 
 type ViewMode = "list" | "kanban" | "calendar";
+
+type SmartList = "none" | "overdue" | "due_today" | "unassigned" | "queued" | "created_by_me";
 
 type TaskForm = {
   title: string;
@@ -143,6 +166,17 @@ function endOfDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
 }
 
+function parseJsonArray<T>(value: string | T[] | null | undefined): T[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function TasksPage() {
   const { data: session } = useSession();
   const me = (session?.user as { username?: string } | undefined)?.username || "";
@@ -163,6 +197,7 @@ export default function TasksPage() {
   const [departmentFilter, setDepartmentFilter] = useState("all");
   const [sortBy, setSortBy] = useState("newest");
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [smartList, setSmartList] = useState<SmartList>("none");
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
@@ -186,6 +221,11 @@ export default function TasksPage() {
   const [detailTask, setDetailTask] = useState<Todo | null>(null);
   const [shareTask, setShareTask] = useState<Todo | null>(null);
   const [shareTarget, setShareTarget] = useState("");
+  const [declineTask, setDeclineTask] = useState<Todo | null>(null);
+  const [declineReason, setDeclineReason] = useState("");
+  const [delegateTask, setDelegateTask] = useState<Todo | null>(null);
+  const [delegateTarget, setDelegateTarget] = useState("");
+  const [detailComment, setDetailComment] = useState("");
 
   const lowerMe = me.toLowerCase();
 
@@ -381,6 +421,20 @@ export default function TasksPage() {
         if (!text.includes(q)) return false;
       }
 
+      if (smartList !== "none") {
+        if (smartList === "overdue") {
+          if (!task.due_date || !(new Date(task.due_date) < todayStart && !isDone(task))) return false;
+        }
+        if (smartList === "due_today") {
+          if (!task.due_date) return false;
+          const due = new Date(task.due_date);
+          if (due < todayStart || due > todayEnd) return false;
+        }
+        if (smartList === "unassigned" && !!task.assigned_to) return false;
+        if (smartList === "queued" && !(task.queue_status === "queued" || !!task.queue_department)) return false;
+        if (smartList === "created_by_me" && (task.username || "").toLowerCase() !== lowerMe) return false;
+      }
+
       return true;
     });
 
@@ -403,7 +457,31 @@ export default function TasksPage() {
     });
 
     return sorted;
-  }, [visibleTasks, quickFilter, statusFilter, priorityFilter, dateFilter, assigneeFilter, departmentFilter, search, sortBy, lowerMe, managerTeam]);
+  }, [visibleTasks, quickFilter, statusFilter, priorityFilter, dateFilter, assigneeFilter, departmentFilter, search, smartList, sortBy, lowerMe, managerTeam]);
+
+  const quickFilterCounts = useMemo(() => {
+    const mine = visibleTasks.filter((task) => {
+      const owner = (task.username || "").toLowerCase();
+      const assignee = (task.assigned_to || "").toLowerCase();
+      return owner === lowerMe || assignee === lowerMe;
+    });
+    const team = visibleTasks.filter((task) => {
+      const owner = (task.username || "").toLowerCase();
+      const assignee = (task.assigned_to || "").toLowerCase();
+      return managerTeam.has(owner) || managerTeam.has(assignee);
+    });
+
+    return {
+      my_pending: mine.filter((t) => !isDone(t)).length,
+      my_all: mine.length,
+      team_pending: team.filter((t) => !isDone(t)).length,
+      team_all: team.length,
+      all_pending: visibleTasks.filter((t) => !isDone(t)).length,
+      all: visibleTasks.length,
+      approval_pending: visibleTasks.filter((t) => isPending(t)).length,
+      approval_all: visibleTasks.filter((t) => (t.approval_status || "") !== "approved").length,
+    };
+  }, [visibleTasks, lowerMe, managerTeam]);
 
   const kpis = useMemo(() => {
     const total = visibleTasks.length;
@@ -661,14 +739,7 @@ export default function TasksPage() {
         });
       }
 
-      if (action === "decline") {
-        await updateTask(task.id, {
-          approval_status: "declined",
-          status: "declined",
-          completed: false,
-          task_status: "in_progress",
-        });
-      }
+      if (action === "decline") return;
 
       if (action === "reopen") {
         await updateTask(task.id, {
@@ -690,6 +761,68 @@ export default function TasksPage() {
       await refreshTasks();
     } catch (error) {
       alert(error instanceof Error ? error.message : "Task action failed");
+    }
+  }
+
+  async function submitDecline() {
+    if (!declineTask) return;
+    try {
+      await updateTask(declineTask.id, {
+        approval_status: "declined",
+        status: "declined",
+        completed: false,
+        task_status: "in_progress",
+        decline_reason: declineReason.trim() || null,
+      });
+      setDeclineTask(null);
+      setDeclineReason("");
+      await refreshTasks();
+    } catch {
+      alert("Could not decline task");
+    }
+  }
+
+  async function submitDelegate() {
+    if (!delegateTask || !delegateTarget) return;
+    try {
+      const chain = parseJsonArray<AssignmentChainEntry>(delegateTask.assignment_chain);
+      const nextChain = [
+        ...chain,
+        {
+          username: delegateTarget,
+          role: "delegate",
+          status: "pending",
+          message: `Delegated by ${me}`,
+          timestamp: new Date().toISOString(),
+        },
+      ];
+
+      await updateTask(delegateTask.id, {
+        assigned_to: delegateTarget,
+        task_status: "todo",
+        status: "open",
+        assignment_chain: JSON.stringify(nextChain),
+      });
+      setDelegateTask(null);
+      setDelegateTarget("");
+      await refreshTasks();
+    } catch {
+      alert("Could not delegate task");
+    }
+  }
+
+  async function addDetailComment() {
+    if (!detailTask || !detailComment.trim()) return;
+    try {
+      const existing = detailTask.notes ? `${detailTask.notes}\n` : "";
+      const nextNotes = `${existing}[${new Date().toLocaleString()}] ${me}: ${detailComment.trim()}`;
+      await updateTask(detailTask.id, { notes: nextNotes });
+      setDetailComment("");
+      await refreshTasks();
+      const updated = tasks.find((t) => t.id === detailTask.id);
+      if (updated) setDetailTask(updated);
+    } catch {
+      alert("Could not add comment");
     }
   }
 
@@ -989,6 +1122,61 @@ export default function TasksPage() {
         </CardHeader>
 
         <CardContent className="space-y-3">
+          <div className="flex flex-wrap gap-2 rounded border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-900/20">
+            {[
+              { key: "my_pending", label: "My Pending" },
+              { key: "my_all", label: "My All" },
+              { key: "team_pending", label: "Team Pending" },
+              { key: "team_all", label: "Team All" },
+              { key: "all_pending", label: "All Pending" },
+              { key: "approval_pending", label: "Approval Pending" },
+            ].map((item) => {
+              const key = item.key as QuickFilter;
+              const active = quickFilter === key;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setQuickFilter(key)}
+                  className={`inline-flex items-center gap-2 rounded px-2 py-1 text-xs font-semibold ${
+                    active
+                      ? "bg-primary-500 text-white"
+                      : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300"
+                  }`}
+                >
+                  {item.label}
+                  <span className="rounded bg-black/10 px-1.5 py-0.5">{quickFilterCounts[key]}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 rounded border border-dashed border-gray-300 p-2 text-xs dark:border-gray-700">
+            <ListFilter className="h-4 w-4" />
+            <span className="font-semibold">Smart Lists:</span>
+            {[
+              { key: "none", label: "None" },
+              { key: "overdue", label: "Overdue" },
+              { key: "due_today", label: "Due Today" },
+              { key: "unassigned", label: "Unassigned" },
+              { key: "queued", label: "Queued" },
+              { key: "created_by_me", label: "Created By Me" },
+            ].map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setSmartList(item.key as SmartList)}
+                className={`rounded px-2 py-1 ${
+                  smartList === item.key
+                    ? "bg-primary-500 text-white"
+                    : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300"
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
           <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-dashed border-gray-300 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/30">
             <div className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
               <Filter className="h-4 w-4" />
@@ -1079,10 +1267,16 @@ export default function TasksPage() {
                           <Button size="sm" variant="success" onClick={() => runTaskAction(task, "approve")}>
                             Approve
                           </Button>
-                          <Button size="sm" variant="danger" onClick={() => runTaskAction(task, "decline")}>
+                          <Button size="sm" variant="danger" onClick={() => { setDeclineTask(task); setDeclineReason(task.decline_reason || ""); }}>
                             Decline
                           </Button>
                         </>
+                      )}
+
+                      {!isDone(task) && (
+                        <Button size="sm" variant="outline" onClick={() => { setDelegateTask(task); setDelegateTarget(""); }}>
+                          <ArrowRightLeft className="h-4 w-4" />
+                        </Button>
                       )}
 
                       {isDone(task) && (
@@ -1328,8 +1522,96 @@ export default function TasksPage() {
                 <p>{detailTask.notes}</p>
               </div>
             )}
+
+            {!!detailTask.decline_reason && (
+              <div className="rounded border border-red-200 bg-red-50 p-2 text-sm dark:border-red-900 dark:bg-red-950/30">
+                <p className="font-semibold text-red-700 dark:text-red-300">Decline Reason</p>
+                <p className="text-red-700 dark:text-red-300">{detailTask.decline_reason}</p>
+              </div>
+            )}
+
+            <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+              <p className="mb-2 font-semibold">Assignment Chain</p>
+              {parseJsonArray<AssignmentChainEntry>(detailTask.assignment_chain).length === 0 && (
+                <p className="text-gray-500">No assignment chain records.</p>
+              )}
+              <div className="space-y-1">
+                {parseJsonArray<AssignmentChainEntry>(detailTask.assignment_chain).map((entry, idx) => (
+                  <div key={`${entry.username}-${idx}`} className="flex items-center gap-2 text-xs">
+                    <CornerDownRight className="h-3 w-3" />
+                    <span className="font-semibold">{entry.username}</span>
+                    <span>{entry.role || "role"}</span>
+                    <Badge variant="outline">{entry.status || "pending"}</Badge>
+                    {entry.timestamp && <span className="text-gray-500">{formatDate(entry.timestamp)}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+              <p className="mb-2 font-semibold">Task History</p>
+              {parseJsonArray<TaskHistoryEntry>(detailTask.history).length === 0 && (
+                <p className="text-gray-500">No history entries.</p>
+              )}
+              <div className="space-y-1">
+                {parseJsonArray<TaskHistoryEntry>(detailTask.history).map((entry, idx) => (
+                  <div key={`${entry.timestamp}-${idx}`} className="text-xs">
+                    <span className="font-semibold">{entry.user}</span>
+                    <span className="mx-1">•</span>
+                    <span>{entry.details}</span>
+                    <span className="mx-1">•</span>
+                    <span className="text-gray-500">{formatDate(entry.timestamp)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+              <p className="mb-2 font-semibold">Add Comment</p>
+              <div className="flex gap-2">
+                <Input value={detailComment} onChange={(e) => setDetailComment(e.target.value)} placeholder="Write update or question..." />
+                <Button onClick={addDetailComment}><MessageSquare className="h-4 w-4" /></Button>
+              </div>
+            </div>
           </div>
         )}
+      </Modal>
+
+      <Modal open={!!declineTask} onClose={() => setDeclineTask(null)} title="Decline Task" size="sm">
+        <div className="space-y-3">
+          <p className="text-sm text-gray-600 dark:text-gray-300">Add reason for declining this task.</p>
+          <textarea
+            value={declineReason}
+            onChange={(e) => setDeclineReason(e.target.value)}
+            rows={4}
+            className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-800"
+            placeholder="Reason"
+          />
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setDeclineTask(null)}>Cancel</Button>
+            <Button variant="danger" onClick={submitDecline}>Decline</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={!!delegateTask} onClose={() => setDelegateTask(null)} title="Delegate Task" size="sm">
+        <div className="space-y-3">
+          <Select
+            label="Delegate To"
+            value={delegateTarget}
+            onChange={(e) => setDelegateTarget(e.target.value)}
+            options={[
+              { value: "", label: "Select user" },
+              ...users
+                .filter((u) => u.username !== me)
+                .map((u) => ({ value: u.username, label: `${u.username} (${u.role})` })),
+            ]}
+          />
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setDelegateTask(null)}>Cancel</Button>
+            <Button onClick={submitDelegate}>Delegate</Button>
+          </div>
+        </div>
       </Modal>
 
       <Modal open={!!shareTask} onClose={() => setShareTask(null)} title="Share Task" size="sm">
