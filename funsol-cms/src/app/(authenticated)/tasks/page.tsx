@@ -324,6 +324,10 @@ export default function TasksPage() {
   const [delegateTask, setDelegateTask] = useState<Todo | null>(null);
   const [delegateTarget, setDelegateTarget] = useState("");
   const [detailComment, setDetailComment] = useState("");
+  const [bulkShareOpen, setBulkShareOpen] = useState(false);
+  const [bulkShareUsers, setBulkShareUsers] = useState<string[]>([]);
+  const [updateDueTask, setUpdateDueTask] = useState<Todo | null>(null);
+  const [updatedDueDate, setUpdatedDueDate] = useState("");
   const [templates, setTemplates] = useState<TaskTemplate[]>([]);
   const [templateName, setTemplateName] = useState("");
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
@@ -1391,6 +1395,58 @@ export default function TasksPage() {
     }
   }
 
+  async function duplicateTask(task: Todo) {
+    try {
+      const payload = {
+        title: `${task.title} (Copy)`,
+        description: task.description || null,
+        our_goal: task.our_goal || null,
+        notes: task.notes || null,
+        priority: task.priority || "medium",
+        due_date: task.due_date || null,
+        app_name: task.app_name || null,
+        package_name: task.package_name || "Others",
+        kpi_type: task.kpi_type || null,
+        username: me,
+        assigned_to: task.assigned_to || me,
+        manager_id: task.manager_id || null,
+        queue_department: task.queue_department || null,
+        queue_status: task.queue_status || null,
+        status: "open",
+        task_status: "todo",
+        approval_status: "approved",
+        category: task.category || "general",
+        attachments: task.attachments || null,
+      };
+      const res = await fetch("/api/todos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error("Duplicate failed");
+      await refreshTasks();
+    } catch {
+      alert("Could not duplicate task");
+    }
+  }
+
+  async function confirmUpdateDueDate() {
+    if (!updateDueTask || !updatedDueDate) return;
+    const due = new Date(updatedDueDate);
+    if (Number.isNaN(due.getTime()) || due.getTime() < Date.now()) {
+      alert("Due date must be in the future");
+      return;
+    }
+    try {
+      await updateTask(updateDueTask.id, { due_date: due.toISOString() });
+      setUpdateDueTask(null);
+      setUpdatedDueDate("");
+      await refreshTasks();
+    } catch {
+      alert("Could not update due date");
+    }
+  }
+
   async function shareCurrentTask() {
     if (!shareTask || !shareTarget) return;
 
@@ -1416,6 +1472,41 @@ export default function TasksPage() {
       await refreshTasks();
     } catch (error) {
       alert(error instanceof Error ? error.message : "Share failed");
+    }
+  }
+
+  async function confirmBulkShare() {
+    if (selectedIds.size === 0) {
+      alert("Select at least one task");
+      return;
+    }
+    if (bulkShareUsers.length === 0) {
+      alert("Select at least one user");
+      return;
+    }
+    try {
+      const ids = Array.from(selectedIds);
+      await Promise.all(
+        ids.flatMap((todoId) =>
+          bulkShareUsers.map((username) =>
+            fetch("/api/todos/shares", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                todo_id: todoId,
+                shared_with: username,
+                shared_by: me,
+                can_edit: true,
+              }),
+            })
+          )
+        )
+      );
+      setBulkShareOpen(false);
+      setBulkShareUsers([]);
+      await refreshTasks();
+    } catch {
+      alert("Bulk share failed");
     }
   }
 
@@ -1833,6 +1924,7 @@ export default function TasksPage() {
             <div className="flex flex-wrap items-center gap-2">
               <Button variant="outline" size="sm" onClick={selectAllVisible}>Select All</Button>
               <Button variant="outline" size="sm" onClick={clearSelection}>Clear</Button>
+              <Button variant="outline" size="sm" onClick={() => setBulkShareOpen(true)}>Bulk Share</Button>
               <Button variant="success" size="sm" onClick={() => runBulkAction("complete")}>Complete</Button>
               <Button variant="outline" size="sm" onClick={() => runBulkAction("archive")}>Archive</Button>
               <Button variant="danger" size="sm" onClick={() => runBulkAction("delete")}>Delete</Button>
@@ -1955,6 +2047,22 @@ export default function TasksPage() {
                       <Button size="sm" variant="outline" onClick={() => openEditModal(task)}>
                         <Pencil className="h-4 w-4" />
                       </Button>
+                      <Button size="sm" variant="outline" onClick={() => duplicateTask(task)} title="Duplicate">
+                        📋
+                      </Button>
+                      {!isDone(task) && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            setUpdateDueTask(task);
+                            setUpdatedDueDate(toInputDateTime(task.due_date));
+                          }}
+                          title="Update Due Date"
+                        >
+                          📅
+                        </Button>
+                      )}
                       {inlineEditId === task.id ? (
                         <>
                           <Button size="sm" variant="success" onClick={() => saveInlineTask(task)}>Save</Button>
@@ -2517,6 +2625,57 @@ export default function TasksPage() {
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={() => setShareTask(null)}>Cancel</Button>
             <Button onClick={shareCurrentTask}>Share</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={bulkShareOpen} onClose={() => setBulkShareOpen(false)} title="Bulk Share Tasks" size="sm">
+        <div className="space-y-3">
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            Share {selectedIds.size} selected task(s) with multiple users.
+          </p>
+          <div className="max-h-64 space-y-2 overflow-y-auto rounded border border-gray-200 p-2 dark:border-gray-700">
+            {users
+              .filter((u) => u.username !== me)
+              .map((u) => {
+                const checked = bulkShareUsers.includes(u.username);
+                return (
+                  <label key={u.username} className="flex items-center gap-2 rounded px-1 py-1 text-sm hover:bg-gray-50 dark:hover:bg-gray-800/50">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(e) => {
+                        if (e.target.checked) setBulkShareUsers((prev) => [...prev, u.username]);
+                        else setBulkShareUsers((prev) => prev.filter((x) => x !== u.username));
+                      }}
+                    />
+                    <span>{u.username}</span>
+                    <span className="text-xs text-gray-500">({u.role})</span>
+                  </label>
+                );
+              })}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setBulkShareOpen(false)}>Cancel</Button>
+            <Button onClick={confirmBulkShare}>Share Selected</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={!!updateDueTask} onClose={() => setUpdateDueTask(null)} title="Update Due Date" size="sm">
+        <div className="space-y-3">
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            Update due date for <strong>{updateDueTask?.title || "task"}</strong>.
+          </p>
+          <Input
+            label="New Due Date"
+            type="datetime-local"
+            value={updatedDueDate}
+            onChange={(e) => setUpdatedDueDate(e.target.value)}
+          />
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setUpdateDueTask(null)}>Cancel</Button>
+            <Button onClick={confirmUpdateDueDate}>Update</Button>
           </div>
         </div>
       </Modal>
