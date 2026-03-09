@@ -7,9 +7,11 @@ export async function GET(req: NextRequest) {
   const supabase = createServerClient();
   const { searchParams } = new URL(req.url);
   const todoId = searchParams.get("todo_id");
+  const sharedWith = searchParams.get("shared_with");
 
   let query = supabase.from("todo_shares").select("*").order("created_at", { ascending: false });
   if (todoId) query = query.eq("todo_id", todoId);
+  if (sharedWith) query = query.eq("shared_with", sharedWith);
 
   const { data, error } = await query;
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
@@ -22,6 +24,18 @@ export async function POST(req: NextRequest) {
 
   if (!body.todo_id || !body.shared_with || !body.shared_by) {
     return NextResponse.json({ error: "todo_id, shared_by, and shared_with are required" }, { status: 400 });
+  }
+
+  // Avoid duplicate share rows for the same task/user pair.
+  const { data: existing } = await supabase
+    .from("todo_shares")
+    .select("id")
+    .eq("todo_id", body.todo_id)
+    .eq("shared_with", body.shared_with)
+    .maybeSingle();
+
+  if (existing?.id) {
+    return NextResponse.json({ error: "Task is already shared with this user" }, { status: 409 });
   }
 
   const { data, error } = await supabase.from("todo_shares").insert({
