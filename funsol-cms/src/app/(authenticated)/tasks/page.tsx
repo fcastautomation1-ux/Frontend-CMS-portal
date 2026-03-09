@@ -1620,7 +1620,7 @@ export default function TasksPage() {
 
   return (
     <div className="legacy-task-ui space-y-6 p-6">
-      <div className="legacy-header flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50 via-white to-blue-50 p-4 dark:border-indigo-900/60 dark:from-indigo-950/30 dark:via-gray-900 dark:to-blue-950/20">
+      <div className="legacy-header legacy-page-header flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50 via-white to-blue-50 p-4 dark:border-indigo-900/60 dark:from-indigo-950/30 dark:via-gray-900 dark:to-blue-950/20">
         <div>
           <h1 className="font-heading text-2xl font-bold text-gray-900 dark:text-white">Task Center</h1>
           <p className="text-sm text-gray-600 dark:text-gray-300">
@@ -1638,7 +1638,7 @@ export default function TasksPage() {
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+      <div className="legacy-stat-grid grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
         {kpis.map((k) => (
           <Card key={k.title} className="legacy-kpi-card border-gray-200 dark:border-gray-700">
             <CardContent className="flex items-center justify-between py-4">
@@ -1941,7 +1941,7 @@ export default function TasksPage() {
                 return (
                   <div
                     key={task.id}
-                    className="grid grid-cols-1 gap-2 rounded border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800 lg:grid-cols-[28px_1fr_auto]"
+                    className="legacy-list-task grid grid-cols-1 gap-2 rounded border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800 lg:grid-cols-[28px_1fr_auto]"
                   >
                     <div className="pt-1">
                       <input type="checkbox" checked={selectedIds.has(task.id)} onChange={() => toggleSelected(task.id)} />
@@ -2104,7 +2104,7 @@ export default function TasksPage() {
           )}
 
           {viewMode === "kanban" && (
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <div className="legacy-kanban-grid grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               {[
                 { key: "backlog", label: "Backlog" },
                 { key: "todo", label: "To Do" },
@@ -2115,7 +2115,7 @@ export default function TasksPage() {
                 return (
                   <div
                     key={col.key}
-                    className="rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-900/30"
+                    className="legacy-kanban-column rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-900/30"
                     onDragOver={(e) => e.preventDefault()}
                     onDrop={async () => {
                       if (!dragTaskId) return;
@@ -2123,7 +2123,7 @@ export default function TasksPage() {
                       setDragTaskId(null);
                     }}
                   >
-                    <div className="mb-2 flex items-center justify-between">
+                    <div className="legacy-kanban-header mb-2 flex items-center justify-between">
                       <p className="text-sm font-semibold text-gray-700 dark:text-gray-200">{col.label}</p>
                       <Badge variant="outline">{colTasks.length}</Badge>
                     </div>
@@ -2137,7 +2137,7 @@ export default function TasksPage() {
                           onDragStart={() => setDragTaskId(task.id)}
                           onDragEnd={() => setDragTaskId(null)}
                           onClick={() => setDetailTask(task)}
-                          className="w-full rounded border border-gray-200 bg-white p-2 text-left hover:border-primary-400 dark:border-gray-700 dark:bg-gray-800"
+                          className="legacy-kanban-task w-full rounded border border-gray-200 bg-white p-2 text-left hover:border-primary-400 dark:border-gray-700 dark:bg-gray-800"
                         >
                           <p className="line-clamp-2 text-sm font-semibold text-gray-900 dark:text-white">{task.title}</p>
                           <p className="mt-1 text-xs text-gray-500">{task.assigned_to || "Unassigned"}</p>
@@ -2684,35 +2684,70 @@ export default function TasksPage() {
         .legacy-task-ui {
           --legacy-border: #e2e8f0;
           --legacy-soft: #f8fafc;
+          --legacy-accent: #2563eb;
+          --legacy-accent-hover: #1d4ed8;
+          --legacy-black: #0f172a;
+          --legacy-gray: #64748b;
+        }
+
+        .legacy-task-ui .legacy-page-header {
+          background: #ffffff;
+          color: var(--legacy-black);
+          border: 1px solid var(--legacy-border);
+          border-radius: 12px;
+          padding: 20px 24px;
+          box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+        }
+
+        .legacy-task-ui .legacy-page-header h1 {
+          font-size: 32px;
+          letter-spacing: -0.5px;
+          gap: 12px;
+        }
+
+        .legacy-task-ui .legacy-page-header p {
+          font-size: 16px;
+          margin-top: 8px;
+          opacity: 0.95;
+          color: var(--legacy-gray);
         }
 
         .legacy-task-ui .legacy-panel {
-          border-radius: 16px;
+          border-radius: 12px;
           border: 1px solid var(--legacy-border);
-          box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.08);
         }
 
         .legacy-task-ui .legacy-panel-head {
           border-bottom: 1px solid var(--legacy-border);
           background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-          border-top-left-radius: 16px;
-          border-top-right-radius: 16px;
+          border-top-left-radius: 12px;
+          border-top-right-radius: 12px;
         }
 
         .legacy-task-ui .legacy-panel-body {
           background: #ffffff;
-          border-bottom-left-radius: 16px;
-          border-bottom-right-radius: 16px;
+          border-bottom-left-radius: 12px;
+          border-bottom-right-radius: 12px;
+        }
+
+        .legacy-task-ui .legacy-stat-grid {
+          gap: 24px;
+          margin-bottom: 6px;
         }
 
         .legacy-task-ui .legacy-kpi-card {
-          border-radius: 14px;
-          background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-          box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05);
+          border-radius: 12px;
+          background: #ffffff;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+          border: 1px solid var(--legacy-border);
+          padding: 4px;
         }
 
         .legacy-task-ui .legacy-filters label {
           font-weight: 700;
+          color: var(--legacy-black);
+          font-size: 14px;
         }
 
         .legacy-task-ui .legacy-route-card {
@@ -2725,11 +2760,85 @@ export default function TasksPage() {
           box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
         }
 
+        .legacy-task-ui .legacy-list-task {
+          border-radius: 10px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+          border: 1px solid var(--legacy-border);
+        }
+
+        .legacy-task-ui .legacy-list-task:hover {
+          border-color: #cbd5e1;
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+        }
+
+        .legacy-task-ui .legacy-kanban-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+          gap: 20px;
+          align-items: flex-start;
+        }
+
+        .legacy-task-ui .legacy-kanban-column {
+          background: #f8fafc;
+          border-radius: 12px;
+          border: 1px solid var(--legacy-border);
+          max-height: 85vh;
+          display: flex;
+          flex-direction: column;
+        }
+
+        .legacy-task-ui .legacy-kanban-header {
+          padding: 12px 14px;
+          border-bottom: 1px solid var(--legacy-border);
+        }
+
+        .legacy-task-ui .legacy-kanban-task {
+          border-radius: 10px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+          border: 1px solid var(--legacy-border);
+          transition: all 0.2s ease;
+        }
+
+        .legacy-task-ui .legacy-kanban-task:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+          border-color: #cbd5e1;
+        }
+
         .legacy-task-ui button,
         .legacy-task-ui input,
         .legacy-task-ui select,
         .legacy-task-ui textarea {
+          border-radius: 8px;
+          font-family: Inter, sans-serif;
+        }
+
+        .legacy-task-ui input,
+        .legacy-task-ui select,
+        .legacy-task-ui textarea {
+          border: 1px solid var(--legacy-border);
+          padding: 14px 18px;
+          font-size: 15px;
+        }
+
+        .legacy-task-ui input:focus,
+        .legacy-task-ui select:focus,
+        .legacy-task-ui textarea:focus {
+          outline: none;
+          border-color: var(--legacy-accent);
+          box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .legacy-task-ui button {
+          padding: 10px 16px;
+          font-size: 14px;
+          font-weight: 600;
+          letter-spacing: 0.01em;
+        }
+
+        .legacy-task-ui [role="dialog"] {
           border-radius: 12px;
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
         }
       `}</style>
     </div>
