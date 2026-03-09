@@ -1622,19 +1622,24 @@ export default function TasksPage() {
     <div className="legacy-task-ui space-y-6 p-6">
       <div className="legacy-header legacy-page-header flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50 via-white to-blue-50 p-4 dark:border-indigo-900/60 dark:from-indigo-950/30 dark:via-gray-900 dark:to-blue-950/20">
         <div>
-          <h1 className="font-heading text-2xl font-bold text-gray-900 dark:text-white">Task Center</h1>
+          <h1 className="font-heading text-2xl font-bold text-gray-900 dark:text-white">📝 Task Center</h1>
           <p className="text-sm text-gray-600 dark:text-gray-300">
             Same as legacy task module: filters, routing, queue, approvals, templates, and full workflows.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant={panel === "workboard" ? "primary" : "outline"} onClick={() => setPanel("workboard")}>Workboard</Button>
-          <Button variant={panel === "queue" ? "primary" : "outline"} onClick={() => setPanel("queue")}>Queue Board</Button>
-          <Button variant={panel === "approval" ? "primary" : "outline"} onClick={() => setPanel("approval")}>Approval Desk</Button>
-          <Button variant="outline" onClick={() => exportTasks("csv")}> <Download className="h-4 w-4" /> CSV </Button>
-          <Button variant="outline" onClick={() => exportTasks("json")}> <Download className="h-4 w-4" /> JSON </Button>
-          <Button onClick={openCreateModal}> <Plus className="h-4 w-4" /> New Task </Button>
+          <div className="legacy-user-info rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
+            <span className="font-semibold">{me || "user"}</span>
+            <span className="mx-1">•</span>
+            <span>{currentUser?.role || "Member"}</span>
+          </div>
+          <Button variant={panel === "workboard" ? "primary" : "outline"} onClick={() => setPanel("workboard")}>📋 Workboard</Button>
+          <Button variant={panel === "queue" ? "primary" : "outline"} onClick={() => setPanel("queue")}>🏢 Queue Board</Button>
+          <Button variant={panel === "approval" ? "primary" : "outline"} onClick={() => setPanel("approval")}>✅ Approval Desk</Button>
+          <Button variant="outline" onClick={() => exportTasks("csv")}> <Download className="h-4 w-4" /> Export CSV </Button>
+          <Button variant="outline" onClick={() => exportTasks("json")}> <Download className="h-4 w-4" /> Export JSON </Button>
+          <Button onClick={openCreateModal}> <Plus className="h-4 w-4" /> Add New Task </Button>
         </div>
       </div>
 
@@ -2710,6 +2715,18 @@ export default function TasksPage() {
           margin-top: 8px;
           opacity: 0.95;
           color: var(--legacy-gray);
+        }
+
+        .legacy-task-ui .legacy-user-info {
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          padding: 8px 16px;
+          background: #f8fafc;
+          border: 1px solid var(--legacy-border);
+          border-radius: 20px;
+          font-size: 14px;
+          font-weight: 500;
         }
 
         .legacy-task-ui .legacy-panel {
