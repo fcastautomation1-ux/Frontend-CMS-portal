@@ -856,41 +856,82 @@ export default function TasksPage() {
   }
 
   async function submitTask() {
-    if (!form.title.trim()) {
-      alert("Task subject is required");
+    const title = form.title.trim();
+    const routeMode = form.route_mode;
+    const isSelfTodo = routeMode === "self";
+
+    if (!form.kpi_type.trim()) {
+      alert("Please select KPI's.");
       return;
     }
 
-    if (form.title.trim().length < 3 || form.title.trim().length > 30) {
-      alert("Subject must be between 3 and 30 characters");
+    if (!title) {
+      alert("Please enter a task title.");
       return;
     }
 
-    if (!form.due_date) {
-      alert("Due date is required");
+    if (title.length < 3 || title.length > 30) {
+      alert("Title must be between 3 and 30 characters");
       return;
     }
 
-    const due = new Date(form.due_date);
-    if (Number.isNaN(due.getTime())) {
-      alert("Please enter a valid due date");
+    // Legacy behavior: due date is mandatory for non-self routing.
+    if (!isSelfTodo && !form.due_date) {
+      alert("Please set a due date for this task.");
       return;
     }
 
-    if (due.getTime() < Date.now()) {
-      alert("Due date must be in the future");
-      return;
+    let dueIso: string | null = null;
+    if (form.due_date) {
+      const due = new Date(form.due_date);
+      if (Number.isNaN(due.getTime())) {
+        alert("Please enter a valid due date");
+        return;
+      }
+
+      if (due.getTime() < Date.now()) {
+        alert("Due date must be in the future");
+        return;
+      }
+      dueIso = due.toISOString();
+    }
+
+    const normalizedPackage = (form.package_name.trim() || "Others");
+
+    // Legacy behavior: for new non-self tasks, a routing option must be explicit and valid.
+    if (!editingTask && !isSelfTodo) {
+      if (!["department", "manager", "multi"].includes(routeMode)) {
+        alert("Please select a routing option: Self, Department, Manager, or Multi-Assignment.");
+        return;
+      }
+      if (routeMode === "department" && !form.queue_department.trim()) {
+        alert("Please select a department to send this task to.");
+        return;
+      }
+      if (routeMode === "manager" && !form.assigned_to.trim()) {
+        alert("Please select a manager to send this task to.");
+        return;
+      }
+      if (routeMode === "multi") {
+        const selected = parseCsv(form.assignees_csv)
+          .map((x) => x.toLowerCase())
+          .filter((x, i, arr) => arr.indexOf(x) === i);
+        if (selected.length === 0) {
+          alert("Please select at least one user for multi-assignment.");
+          return;
+        }
+      }
     }
 
     const payload: Record<string, unknown> = {
-      title: form.title.trim(),
+      title,
       description: form.description.trim() || null,
       our_goal: form.our_goal.trim() || null,
       notes: form.notes.trim() || null,
       priority: form.priority,
-      due_date: due.toISOString(),
+      due_date: dueIso,
       app_name: form.app_name.trim() || null,
-      package_name: form.package_name.trim() || null,
+      package_name: normalizedPackage,
       kpi_type: form.kpi_type.trim() || null,
       attachments: creationFiles.length > 0
         ? JSON.stringify(creationFiles.map((f) => ({ name: f.name, size: f.size, type: f.type })))
@@ -911,7 +952,7 @@ export default function TasksPage() {
 
     if (form.route_mode === "manager") {
       if (!form.assigned_to) {
-        alert("Please choose a manager");
+        alert("Please select a manager to send this task to.");
         return;
       }
       payload.assigned_to = form.assigned_to;
@@ -922,7 +963,7 @@ export default function TasksPage() {
 
     if (form.route_mode === "department") {
       if (!form.queue_department.trim()) {
-        alert("Please enter queue department");
+        alert("Please select a department to send this task to.");
         return;
       }
       payload.assigned_to = null;
@@ -937,10 +978,19 @@ export default function TasksPage() {
       const all = parseCsv(form.assignees_csv)
         .map((x) => x.toLowerCase())
         .filter((x, i, arr) => arr.indexOf(x) === i);
+
       if (all.length === 0) {
-        alert("Please add assignees for multi-routing");
+        alert("Please select at least one user for multi-assignment.");
         return;
       }
+
+      const validUsers = new Set(users.map((u) => u.username.toLowerCase()));
+      const invalid = all.filter((u) => !validUsers.has(u));
+      if (invalid.length > 0) {
+        alert(`Unknown assignee username(s): ${invalid.join(", ")}`);
+        return;
+      }
+
       payload.assigned_to = all[0];
       payload.manager_id = null;
       payload.queue_department = null;
