@@ -141,18 +141,15 @@ type TaskTemplate = {
 };
 
 const FORM_DRAFT_KEY = "legacy_tasks_form_draft_v2";
+type TaskMetadata = {
+  appNames: string[];
+  packageNames: string[];
+  kpiTypes: string[];
+  priorities: string[];
+  statuses: string[];
+  appPackagePairs: Array<{ app_name: string; package_name: string }>;
+};
 const TEMPLATE_KEY = "legacy_tasks_templates_v1";
-const KPI_OPTIONS = [
-  "Monitizations",
-  "Store Graphics",
-  "Creative Graphic",
-  "Andriod Vitls",
-  "Bugs",
-  "New Feature",
-  "SDK Updates",
-  "Data Analysis",
-  "Others",
-];
 
 function parseCsv(value: string | null | undefined): string[] {
   if (!value) return [];
@@ -209,6 +206,15 @@ function parseJsonArray<T>(value: string | T[] | null | undefined): T[] {
   } catch {
     return [];
   }
+}
+
+function titleCase(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join(" ");
 }
 
 export default function TasksPage() {
@@ -269,6 +275,14 @@ export default function TasksPage() {
   const [templateName, setTemplateName] = useState("");
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
   const [creationFiles, setCreationFiles] = useState<File[]>([]);
+  const [metadata, setMetadata] = useState<TaskMetadata>({
+    appNames: [],
+    packageNames: [],
+    kpiTypes: [],
+    priorities: [],
+    statuses: [],
+    appPackagePairs: [],
+  });
   const ourGoalRef = useRef<HTMLDivElement>(null);
 
   const lowerMe = me.toLowerCase();
@@ -281,14 +295,15 @@ export default function TasksPage() {
       }
 
       try {
-        const [userRes, usersRes, todoRes, shareRes] = await Promise.all([
+        const [userRes, usersRes, todoRes, shareRes, metaRes] = await Promise.all([
           fetch(`/api/users?username=${encodeURIComponent(me)}`, { cache: "no-store" }),
           fetch("/api/users", { cache: "no-store" }),
           fetch("/api/todos", { cache: "no-store" }),
           fetch(`/api/todos/shares?shared_with=${encodeURIComponent(me)}`, { cache: "no-store" }),
+          fetch("/api/todos/metadata", { cache: "no-store" }),
         ]);
 
-        if (!userRes.ok || !usersRes.ok || !todoRes.ok || !shareRes.ok) {
+        if (!userRes.ok || !usersRes.ok || !todoRes.ok || !shareRes.ok || !metaRes.ok) {
           throw new Error("Failed to load data");
         }
 
@@ -296,6 +311,7 @@ export default function TasksPage() {
         const usersJson = await usersRes.json();
         const todoJson = await todoRes.json();
         const shareJson = await shareRes.json();
+          const metaJson = await metaRes.json();
 
         const meRow = Array.isArray(userJson) ? userJson[0] : userJson;
         const allUsers = Array.isArray(usersJson) ? usersJson : [];
@@ -324,6 +340,14 @@ export default function TasksPage() {
         setUsers(normalizedUsers);
         setTasks(allTasks);
         setSharedTaskIds(new Set(shares.map((s) => s.todo_id)));
+        setMetadata({
+          appNames: Array.isArray(metaJson.appNames) ? metaJson.appNames : [],
+          packageNames: Array.isArray(metaJson.packageNames) ? metaJson.packageNames : [],
+          kpiTypes: Array.isArray(metaJson.kpiTypes) ? metaJson.kpiTypes : [],
+          priorities: Array.isArray(metaJson.priorities) ? metaJson.priorities : [],
+          statuses: Array.isArray(metaJson.statuses) ? metaJson.statuses : [],
+          appPackagePairs: Array.isArray(metaJson.appPackagePairs) ? metaJson.appPackagePairs : [],
+        });
 
         if (meNormalized) {
           if (isAdminLike(meNormalized)) {
@@ -414,6 +438,7 @@ export default function TasksPage() {
       if (quickFilter === "other_approval_pending" && !((task.username || "").toLowerCase() !== lowerMe && pendingApproval)) return false;
 
       if (statusFilter !== "all") {
+        let matchedKnown = false;
         if (statusFilter === "pending" && isDone(task)) return false;
         if (statusFilter === "queue" && !(task.queue_status === "queued" || !!task.queue_department)) return false;
         if (statusFilter === "inprogress" && !((task.task_status || "") === "in_progress" || (task.status || "") === "in-progress")) return false;
@@ -422,6 +447,15 @@ export default function TasksPage() {
           if (!task.due_date || !(new Date(task.due_date) < todayStart && !isDone(task))) return false;
         }
         if (statusFilter === "archived" && !task.archived) return false;
+        if (["pending", "queue", "inprogress", "completed", "overdue", "archived"].includes(statusFilter)) {
+          matchedKnown = true;
+        }
+        if (!matchedKnown) {
+          const rawStatus = (task.status || "").toLowerCase();
+          const rawTaskStatus = (task.task_status || "").toLowerCase();
+          const selected = statusFilter.toLowerCase();
+          if (!(rawStatus === selected || rawTaskStatus === selected)) return false;
+        }
       }
 
       if (priorityFilter !== "all" && task.priority !== priorityFilter) return false;
@@ -666,21 +700,8 @@ export default function TasksPage() {
       .map((u) => ({ value: u.username, label: `${u.username} (${u.role})` }));
   }, [users]);
 
-  const appOptions = useMemo(() => {
-    const set = new Set<string>();
-    tasks.forEach((t) => {
-      if (t.app_name) set.add(t.app_name);
-    });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [tasks]);
-
-  const packageOptions = useMemo(() => {
-    const set = new Set<string>();
-    tasks.forEach((t) => {
-      if (t.package_name) set.add(t.package_name);
-    });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [tasks]);
+  const appOptions = metadata.appNames;
+  const packageOptions = metadata.packageNames;
 
   useEffect(() => {
     if (!taskModalOpen) return;
@@ -750,14 +771,14 @@ export default function TasksPage() {
   }
 
   function syncAppToPackage(appName: string) {
-    const matches = tasks.filter((t) => (t.app_name || "") === appName && !!t.package_name);
-    const unique = Array.from(new Set(matches.map((m) => m.package_name as string)));
+    const matches = metadata.appPackagePairs.filter((pair) => pair.app_name === appName);
+    const unique = Array.from(new Set(matches.map((m) => m.package_name)));
     setForm((p) => ({ ...p, app_name: appName, package_name: unique.length === 1 ? unique[0] : p.package_name }));
   }
 
   function syncPackageToApp(pkg: string) {
-    const matches = tasks.filter((t) => (t.package_name || "") === pkg && !!t.app_name);
-    const unique = Array.from(new Set(matches.map((m) => m.app_name as string)));
+    const matches = metadata.appPackagePairs.filter((pair) => pair.package_name === pkg);
+    const unique = Array.from(new Set(matches.map((m) => m.app_name)));
     setForm((p) => ({ ...p, package_name: pkg, app_name: unique.length === 1 ? unique[0] : p.app_name }));
   }
 
@@ -769,16 +790,26 @@ export default function TasksPage() {
   }
 
   async function refreshTasks() {
-    const [todoRes, shareRes] = await Promise.all([
+    const [todoRes, shareRes, metaRes] = await Promise.all([
       fetch("/api/todos", { cache: "no-store" }),
       fetch(`/api/todos/shares?shared_with=${encodeURIComponent(me)}`, { cache: "no-store" }),
+      fetch("/api/todos/metadata", { cache: "no-store" }),
     ]);
 
     const todoJson = await todoRes.json();
     const shareJson = await shareRes.json();
+    const metaJson = await metaRes.json();
 
     setTasks(Array.isArray(todoJson) ? todoJson : []);
     setSharedTaskIds(new Set(Array.isArray(shareJson) ? shareJson.map((s: TodoShare) => s.todo_id) : []));
+    setMetadata({
+      appNames: Array.isArray(metaJson.appNames) ? metaJson.appNames : [],
+      packageNames: Array.isArray(metaJson.packageNames) ? metaJson.packageNames : [],
+      kpiTypes: Array.isArray(metaJson.kpiTypes) ? metaJson.kpiTypes : [],
+      priorities: Array.isArray(metaJson.priorities) ? metaJson.priorities : [],
+      statuses: Array.isArray(metaJson.statuses) ? metaJson.statuses : [],
+      appPackagePairs: Array.isArray(metaJson.appPackagePairs) ? metaJson.appPackagePairs : [],
+    });
   }
 
   async function submitTask() {
@@ -1342,12 +1373,7 @@ export default function TasksPage() {
               onChange={(e) => setStatusFilter(e.target.value)}
               options={[
                 { value: "all", label: "All Statuses" },
-                { value: "pending", label: "Pending" },
-                { value: "queue", label: "Queue" },
-                { value: "inprogress", label: "In Progress" },
-                { value: "completed", label: "Completed" },
-                { value: "overdue", label: "Overdue" },
-                { value: "archived", label: "Archived" },
+                ...metadata.statuses.map((s) => ({ value: s, label: titleCase(s) })),
               ]}
             />
 
@@ -1357,10 +1383,7 @@ export default function TasksPage() {
               onChange={(e) => setPriorityFilter(e.target.value)}
               options={[
                 { value: "all", label: "All Priorities" },
-                { value: "urgent", label: "Urgent" },
-                { value: "high", label: "High" },
-                { value: "medium", label: "Medium" },
-                { value: "low", label: "Low" },
+                ...metadata.priorities.map((p) => ({ value: p, label: titleCase(p) })),
               ]}
             />
 
@@ -1847,7 +1870,7 @@ export default function TasksPage() {
             label="KPI's"
             value={form.kpi_type}
             onChange={(e) => setForm((p) => ({ ...p, kpi_type: e.target.value }))}
-            options={[{ value: "", label: "-- Select KPI --" }, ...KPI_OPTIONS.map((k) => ({ value: k, label: k }))]}
+            options={[{ value: "", label: "-- Select KPI --" }, ...metadata.kpiTypes.map((k) => ({ value: k, label: k }))]}
           />
 
           <div className="rounded border border-gray-200 p-2 text-xs dark:border-gray-700">
@@ -1868,10 +1891,7 @@ export default function TasksPage() {
             value={form.priority}
             onChange={(e) => setForm((p) => ({ ...p, priority: e.target.value as TaskForm["priority"] }))}
             options={[
-              { value: "urgent", label: "Urgent" },
-              { value: "high", label: "High" },
-              { value: "medium", label: "Medium" },
-              { value: "low", label: "Low" },
+              ...metadata.priorities.map((priority) => ({ value: priority, label: titleCase(priority) })),
             ]}
           />
 
