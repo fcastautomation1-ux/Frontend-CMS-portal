@@ -148,8 +148,13 @@ type TaskMetadata = {
   priorities: string[];
   statuses: string[];
   appPackagePairs: Array<{ app_name: string; package_name: string }>;
+  quickFilters: Array<{ value: string; label: string }>;
+  smartLists: Array<{ value: string; label: string }>;
+  dateFilters: Array<{ value: string; label: string }>;
+  messageFilters: Array<{ value: string; label: string }>;
+  sortOptions: Array<{ value: string; label: string }>;
+  routingModes: Array<{ value: string; label: string }>;
 };
-const TEMPLATE_KEY = "legacy_tasks_templates_v1";
 
 function parseCsv(value: string | null | undefined): string[] {
   if (!value) return [];
@@ -217,6 +222,31 @@ function titleCase(value: string): string {
     .join(" ");
 }
 
+function normalizeOptions(input: unknown): Array<{ value: string; label: string }> {
+  if (!Array.isArray(input)) return [];
+  const mapped = input
+    .map((item) => {
+      if (typeof item === "string") {
+        return { value: item, label: titleCase(item) };
+      }
+      if (item && typeof item === "object") {
+        const raw = item as Record<string, unknown>;
+        const value = String(raw.value || "").trim();
+        const label = String(raw.label || "").trim();
+        if (!value) return null;
+        return { value, label: label || titleCase(value) };
+      }
+      return null;
+    })
+    .filter(Boolean) as Array<{ value: string; label: string }>;
+
+  const dedup = new Map<string, { value: string; label: string }>();
+  mapped.forEach((m) => {
+    if (!dedup.has(m.value)) dedup.set(m.value, m);
+  });
+  return Array.from(dedup.values());
+}
+
 export default function TasksPage() {
   const { data: session } = useSession();
   const me = (session?.user as { username?: string } | undefined)?.username || "";
@@ -282,6 +312,12 @@ export default function TasksPage() {
     priorities: [],
     statuses: [],
     appPackagePairs: [],
+    quickFilters: [],
+    smartLists: [],
+    dateFilters: [],
+    messageFilters: [],
+    sortOptions: [],
+    routingModes: [],
   });
   const ourGoalRef = useRef<HTMLDivElement>(null);
 
@@ -347,7 +383,19 @@ export default function TasksPage() {
           priorities: Array.isArray(metaJson.priorities) ? metaJson.priorities : [],
           statuses: Array.isArray(metaJson.statuses) ? metaJson.statuses : [],
           appPackagePairs: Array.isArray(metaJson.appPackagePairs) ? metaJson.appPackagePairs : [],
+          quickFilters: normalizeOptions(metaJson.quickFilters),
+          smartLists: normalizeOptions(metaJson.smartLists),
+          dateFilters: normalizeOptions(metaJson.dateFilters),
+          messageFilters: normalizeOptions(metaJson.messageFilters),
+          sortOptions: normalizeOptions(metaJson.sortOptions),
+          routingModes: normalizeOptions(metaJson.routingModes),
         });
+
+        const templateRes = await fetch(`/api/todos/templates?username=${encodeURIComponent(me)}`, { cache: "no-store" });
+        if (templateRes.ok) {
+          const templateJson = await templateRes.json();
+          setTemplates(Array.isArray(templateJson) ? templateJson : []);
+        }
 
         if (meNormalized) {
           if (isAdminLike(meNormalized)) {
@@ -708,21 +756,6 @@ export default function TasksPage() {
     localStorage.setItem(FORM_DRAFT_KEY, JSON.stringify(form));
   }, [form, taskModalOpen]);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(TEMPLATE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) setTemplates(parsed as TaskTemplate[]);
-    } catch {
-      // Ignore malformed template cache.
-    }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templates));
-  }, [templates]);
-
   function resetForm() {
     setForm({
       title: "",
@@ -809,6 +842,12 @@ export default function TasksPage() {
       priorities: Array.isArray(metaJson.priorities) ? metaJson.priorities : [],
       statuses: Array.isArray(metaJson.statuses) ? metaJson.statuses : [],
       appPackagePairs: Array.isArray(metaJson.appPackagePairs) ? metaJson.appPackagePairs : [],
+      quickFilters: normalizeOptions(metaJson.quickFilters),
+      smartLists: normalizeOptions(metaJson.smartLists),
+      dateFilters: normalizeOptions(metaJson.dateFilters),
+      messageFilters: normalizeOptions(metaJson.messageFilters),
+      sortOptions: normalizeOptions(metaJson.sortOptions),
+      routingModes: normalizeOptions(metaJson.routingModes),
     });
   }
 
@@ -958,18 +997,24 @@ export default function TasksPage() {
     }
   }
 
-  function saveTemplateFromForm() {
+  async function saveTemplateFromForm() {
     const name = templateName.trim();
     if (!name) {
       alert("Template name is required");
       return;
     }
-    const tpl: TaskTemplate = {
-      id: `${Date.now()}`,
-      name,
-      form,
-    };
-    setTemplates((prev) => [tpl, ...prev]);
+    const id = `${Date.now()}`;
+    const res = await fetch("/api/todos/templates", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: me, id, name, form }),
+    });
+    if (!res.ok) {
+      alert("Failed to save template");
+      return;
+    }
+    const saved = await res.json();
+    setTemplates((prev) => [saved, ...prev]);
     setTemplateName("");
   }
 
@@ -980,7 +1025,12 @@ export default function TasksPage() {
     setTaskModalOpen(true);
   }
 
-  function deleteTemplate(id: string) {
+  async function deleteTemplate(id: string) {
+    const res = await fetch(`/api/todos/templates?username=${encodeURIComponent(me)}&id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok) {
+      alert("Failed to delete template");
+      return;
+    }
     setTemplates((prev) => prev.filter((t) => t.id !== id));
     if (selectedTemplateId === id) setSelectedTemplateId("");
   }
@@ -1354,16 +1404,7 @@ export default function TasksPage() {
               value={quickFilter}
               onChange={(e) => setQuickFilter(e.target.value as QuickFilter)}
               options={[
-                { value: "my_pending", label: "My Pending" },
-                { value: "my_all", label: "My All" },
-                { value: "team_pending", label: "Team Pending" },
-                { value: "team_all", label: "Team All" },
-                { value: "all_pending", label: "All Pending" },
-                { value: "all", label: "All Tasks" },
-                { value: "approval_pending", label: "Approval Pending" },
-                { value: "approval_all", label: "Approval Queue" },
-                { value: "my_approval_pending", label: "Need My Approval" },
-                { value: "other_approval_pending", label: "Others Approval" },
+                ...metadata.quickFilters,
               ]}
             />
 
@@ -1392,18 +1433,7 @@ export default function TasksPage() {
               value={dateFilter}
               onChange={(e) => setDateFilter(e.target.value)}
               options={[
-                { value: "all", label: "All Dates" },
-                { value: "today", label: "Today" },
-                { value: "yesterday", label: "Yesterday" },
-                { value: "last7days", label: "Last 7 Days" },
-                { value: "last30days", label: "Last 30 Days" },
-                { value: "thisweek", label: "This Week" },
-                { value: "lastweek", label: "Last Week" },
-                { value: "thismonth", label: "This Month" },
-                { value: "lastmonth", label: "Last Month" },
-                { value: "thisyear", label: "This Year" },
-                { value: "overdue", label: "Overdue" },
-                { value: "custom", label: "Custom Range" },
+                ...metadata.dateFilters,
               ]}
             />
 
@@ -1412,9 +1442,7 @@ export default function TasksPage() {
               value={messageFilter}
               onChange={(e) => setMessageFilter(e.target.value)}
               options={[
-                { value: "all", label: "All Messages" },
-                { value: "unread", label: "Unread" },
-                { value: "read", label: "Read" },
+                ...metadata.messageFilters,
               ]}
             />
 
@@ -1437,11 +1465,7 @@ export default function TasksPage() {
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value)}
               options={[
-                { value: "position", label: "Custom Order" },
-                { value: "newest", label: "Newest" },
-                { value: "oldest", label: "Oldest" },
-                { value: "due_soon", label: "Due Soon" },
-                { value: "priority", label: "Priority" },
+                ...metadata.sortOptions,
               ]}
             />
 
@@ -1578,21 +1602,12 @@ export default function TasksPage() {
           {panel === "workboard" && (
             <>
           <div className="flex flex-wrap gap-2 rounded border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-900/20">
-            {[
-              { key: "my_pending", label: "My Pending" },
-              { key: "my_all", label: "My All" },
-              { key: "team_pending", label: "Team Pending" },
-              { key: "team_all", label: "Team All" },
-              { key: "all_pending", label: "All Pending" },
-              { key: "approval_pending", label: "Approval Pending" },
-              { key: "my_approval_pending", label: "Need My Approval" },
-              { key: "other_approval_pending", label: "Others Approval" },
-            ].map((item) => {
-              const key = item.key as QuickFilter;
+            {metadata.quickFilters.map((item) => {
+              const key = item.value as QuickFilter;
               const active = quickFilter === key;
               return (
                 <button
-                  key={item.key}
+                  key={item.value}
                   type="button"
                   onClick={() => setQuickFilter(key)}
                   className={`inline-flex items-center gap-2 rounded px-2 py-1 text-xs font-semibold ${
@@ -1602,7 +1617,7 @@ export default function TasksPage() {
                   }`}
                 >
                   {item.label}
-                  <span className="rounded bg-black/10 px-1.5 py-0.5">{quickFilterCounts[key]}</span>
+                  <span className="rounded bg-black/10 px-1.5 py-0.5">{quickFilterCounts[key] || 0}</span>
                 </button>
               );
             })}
@@ -1611,25 +1626,13 @@ export default function TasksPage() {
           <div className="flex flex-wrap items-center gap-2 rounded border border-dashed border-gray-300 p-2 text-xs dark:border-gray-700">
             <ListFilter className="h-4 w-4" />
             <span className="font-semibold">Smart Lists:</span>
-            {[
-              { key: "all", label: "All" },
-              { key: "today", label: "Today" },
-              { key: "upcoming", label: "Upcoming" },
-              { key: "overdue", label: "Overdue" },
-              { key: "thisweek", label: "This Week" },
-              { key: "thismonth", label: "This Month" },
-              { key: "my_approval_pending", label: "My Approval Pending" },
-              { key: "other_approval_pending", label: "Other Approval Pending" },
-              { key: "unassigned", label: "Unassigned" },
-              { key: "queued", label: "Queued" },
-              { key: "created_by_me", label: "Created By Me" },
-            ].map((item) => (
+            {metadata.smartLists.map((item) => (
               <button
-                key={item.key}
+                key={item.value}
                 type="button"
-                onClick={() => setSmartList(item.key as SmartList)}
+                onClick={() => setSmartList(item.value as SmartList)}
                 className={`rounded px-2 py-1 ${
-                  smartList === item.key
+                  smartList === item.value
                     ? "bg-primary-500 text-white"
                     : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300"
                 }`}
@@ -1964,18 +1967,13 @@ export default function TasksPage() {
           <p className="mb-2 text-sm font-semibold text-gray-800 dark:text-gray-200">Routing</p>
 
           <div className="grid gap-3 md:grid-cols-3">
-            {[
-              { key: "self", label: "Self/User" },
-              { key: "department", label: "Department Queue" },
-              { key: "manager", label: "Manager" },
-              { key: "multi", label: "Multi-Assign" },
-            ].map((opt) => (
+            {metadata.routingModes.map((opt) => (
               <button
-                key={opt.key}
+                key={opt.value}
                 type="button"
-                onClick={() => setForm((p) => ({ ...p, route_mode: opt.key as TaskForm["route_mode"] }))}
+                onClick={() => setForm((p) => ({ ...p, route_mode: opt.value as TaskForm["route_mode"] }))}
                 className={`rounded border p-3 text-left text-sm ${
-                  form.route_mode === opt.key
+                  form.route_mode === opt.value
                     ? "border-primary-500 bg-primary-50 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300"
                     : "border-gray-300 text-gray-700 dark:border-gray-600 dark:text-gray-300"
                 }`}

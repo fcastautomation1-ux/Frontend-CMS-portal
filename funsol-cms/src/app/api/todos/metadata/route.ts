@@ -16,9 +16,20 @@ function uniqueSorted(values: Array<string | null | undefined>): string[] {
 export async function GET() {
   const supabase = createServerClient();
 
-  const [todosRes, packagesRes] = await Promise.all([
+  const [todosRes, packagesRes, configRes] = await Promise.all([
     supabase.from("todos").select("app_name,package_name,kpi_type,priority,status").limit(10000),
     supabase.from("packages").select("*").limit(10000),
+    supabase
+      .from("credentials")
+      .select("name,value")
+      .in("name", [
+        "todo_ui_quick_filters",
+        "todo_ui_smart_lists",
+        "todo_ui_date_filters",
+        "todo_ui_message_filters",
+        "todo_ui_sort_options",
+        "todo_ui_routing_modes",
+      ]),
   ]);
 
   const todos = todosRes.data || [];
@@ -51,6 +62,15 @@ export async function GET() {
     .filter((r) => r.app_name && r.package_name)
     .filter((r, i, arr) => arr.findIndex((x) => x.app_name === r.app_name && x.package_name === r.package_name) === i);
 
+  const configMap = new Map<string, unknown>();
+  (configRes.data || []).forEach((row: any) => {
+    try {
+      configMap.set(row.name, row.value ? JSON.parse(row.value) : []);
+    } catch {
+      configMap.set(row.name, []);
+    }
+  });
+
   return NextResponse.json({
     appNames,
     packageNames,
@@ -58,5 +78,11 @@ export async function GET() {
     priorities,
     statuses,
     appPackagePairs,
+    quickFilters: Array.isArray(configMap.get("todo_ui_quick_filters")) ? configMap.get("todo_ui_quick_filters") : [],
+    smartLists: Array.isArray(configMap.get("todo_ui_smart_lists")) ? configMap.get("todo_ui_smart_lists") : [],
+    dateFilters: Array.isArray(configMap.get("todo_ui_date_filters")) ? configMap.get("todo_ui_date_filters") : [],
+    messageFilters: Array.isArray(configMap.get("todo_ui_message_filters")) ? configMap.get("todo_ui_message_filters") : [],
+    sortOptions: Array.isArray(configMap.get("todo_ui_sort_options")) ? configMap.get("todo_ui_sort_options") : [],
+    routingModes: Array.isArray(configMap.get("todo_ui_routing_modes")) ? configMap.get("todo_ui_routing_modes") : [],
   });
 }
