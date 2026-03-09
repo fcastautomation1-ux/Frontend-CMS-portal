@@ -305,6 +305,10 @@ export default function TasksPage() {
   const [templateName, setTemplateName] = useState("");
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
   const [creationFiles, setCreationFiles] = useState<File[]>([]);
+  const [inlineEditId, setInlineEditId] = useState<string | null>(null);
+  const [inlineTitle, setInlineTitle] = useState("");
+  const [inlineDueDate, setInlineDueDate] = useState("");
+  const [dragTaskId, setDragTaskId] = useState<string | null>(null);
   const [metadata, setMetadata] = useState<TaskMetadata>({
     appNames: [],
     packageNames: [],
@@ -1035,6 +1039,105 @@ export default function TasksPage() {
     if (selectedTemplateId === id) setSelectedTemplateId("");
   }
 
+  async function saveInlineTask(task: Todo) {
+    const title = inlineTitle.trim();
+    if (!title) {
+      alert("Title is required");
+      return;
+    }
+    const updates: Record<string, unknown> = { title };
+    if (inlineDueDate) {
+      const due = new Date(inlineDueDate);
+      if (Number.isNaN(due.getTime())) {
+        alert("Invalid due date");
+        return;
+      }
+      updates.due_date = due.toISOString();
+    }
+    try {
+      await updateTask(task.id, updates);
+      setInlineEditId(null);
+      setInlineTitle("");
+      setInlineDueDate("");
+      await refreshTasks();
+    } catch {
+      alert("Could not save inline edits");
+    }
+  }
+
+  function downloadAttachment(att: { name?: string; size?: number; type?: string }) {
+    const payload = JSON.stringify(att, null, 2);
+    const blob = new Blob([payload], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${att.name || "attachment"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function deleteAttachment(attName: string) {
+    if (!detailTask) return;
+    const attachments = parseJsonArray<{ name?: string; size?: number; type?: string }>(detailTask.attachments || null);
+    const next = attachments.filter((a) => (a.name || "") !== attName);
+    try {
+      await updateTask(detailTask.id, { attachments: JSON.stringify(next) });
+      setDetailTask({ ...detailTask, attachments: JSON.stringify(next) });
+      await refreshTasks();
+    } catch {
+      alert("Could not delete attachment");
+    }
+  }
+
+  async function moveTaskToStatus(taskId: string, nextStatus: "backlog" | "todo" | "in_progress" | "done") {
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    const status = nextStatus === "in_progress" ? "in-progress" : nextStatus === "done" ? "completed" : "open";
+    const completed = nextStatus === "done";
+    try {
+      await updateTask(taskId, {
+        task_status: nextStatus,
+        status,
+        completed,
+        approval_status: completed ? "approved" : task.approval_status || "approved",
+      });
+      await refreshTasks();
+    } catch {
+      alert("Could not move task");
+    }
+  }
+
+  async function autoAssignQueue(dept: string) {
+    const queued = visibleTasks
+      .filter((t) => t.queue_department === dept && t.queue_status === "queued")
+      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    if (queued.length === 0) return;
+
+    const candidates = users
+      .filter((u) => (u.department || "").toLowerCase() === dept.toLowerCase())
+      .map((u) => {
+        const load = visibleTasks.filter((t) => (t.assigned_to || "").toLowerCase() === u.username.toLowerCase() && !isDone(t)).length;
+        return { username: u.username, load };
+      })
+      .sort((a, b) => a.load - b.load);
+
+    if (candidates.length === 0) {
+      alert(`No users found in ${dept} department`);
+      return;
+    }
+
+    try {
+      await updateTask(queued[0].id, {
+        assigned_to: candidates[0].username,
+        queue_status: "claimed",
+        task_status: "todo",
+      });
+      await refreshTasks();
+    } catch {
+      alert("Auto-assignment failed");
+    }
+  }
+
   const queueTasksByDept = useMemo(() => {
     const map = new Map<string, Todo[]>();
     visibleTasks
@@ -1555,7 +1658,12 @@ export default function TasksPage() {
                 <div key={dept} className="rounded border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800">
                   <div className="mb-2 flex items-center justify-between">
                     <p className="font-semibold text-gray-900 dark:text-white">{dept}</p>
-                    <Badge variant="outline">{deptTasks.length}</Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline">{deptTasks.length}</Badge>
+                      <Button size="sm" variant="outline" onClick={() => autoAssignQueue(dept)}>
+                        Auto Assign
+                      </Button>
+                    </div>
                   </div>
                   <div className="space-y-2">
                     {deptTasks.map((task) => (
@@ -1676,7 +1784,15 @@ export default function TasksPage() {
 
                     <div className="space-y-2">
                       <div className="flex flex-wrap items-center gap-2">
-                        <h3 className="font-semibold text-gray-900 dark:text-white">{task.title}</h3>
+                        {inlineEditId === task.id ? (
+                          <Input
+                            value={inlineTitle}
+                            onChange={(e) => setInlineTitle(e.target.value)}
+                            placeholder="Task title"
+                          />
+                        ) : (
+                          <h3 className="font-semibold text-gray-900 dark:text-white">{task.title}</h3>
+                        )}
                         <Badge variant="outline">{task.task_status || "todo"}</Badge>
                         <Badge variant={task.priority === "urgent" ? "danger" : task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
                           {task.priority || "medium"}
@@ -1690,7 +1806,17 @@ export default function TasksPage() {
                         <span className="mx-2">•</span>
                         <span>Assigned: {task.assigned_to || "Unassigned"}</span>
                         <span className="mx-2">•</span>
-                        <span>Due: {task.due_date ? formatDate(task.due_date) : "--"}</span>
+                        {inlineEditId === task.id ? (
+                          <span className="inline-block min-w-[220px]">
+                            <Input
+                              type="datetime-local"
+                              value={inlineDueDate}
+                              onChange={(e) => setInlineDueDate(e.target.value)}
+                            />
+                          </span>
+                        ) : (
+                          <span>Due: {task.due_date ? formatDate(task.due_date) : "--"}</span>
+                        )}
                         {task.app_name && (
                           <>
                             <span className="mx-2">•</span>
@@ -1756,6 +1882,24 @@ export default function TasksPage() {
                       <Button size="sm" variant="outline" onClick={() => openEditModal(task)}>
                         <Pencil className="h-4 w-4" />
                       </Button>
+                      {inlineEditId === task.id ? (
+                        <>
+                          <Button size="sm" variant="success" onClick={() => saveInlineTask(task)}>Save</Button>
+                          <Button size="sm" variant="outline" onClick={() => setInlineEditId(null)}>Cancel</Button>
+                        </>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            setInlineEditId(task.id);
+                            setInlineTitle(task.title || "");
+                            setInlineDueDate(toInputDateTime(task.due_date));
+                          }}
+                        >
+                          Quick Edit
+                        </Button>
+                      )}
                       <Button size="sm" variant="outline" onClick={() => setShareTask(task)}>
                         <Share2 className="h-4 w-4" />
                       </Button>
@@ -1788,7 +1932,16 @@ export default function TasksPage() {
               ].map((col) => {
                 const colTasks = filteredTasks.filter((t) => (t.task_status || "todo") === col.key);
                 return (
-                  <div key={col.key} className="rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-900/30">
+                  <div
+                    key={col.key}
+                    className="rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-900/30"
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={async () => {
+                      if (!dragTaskId) return;
+                      await moveTaskToStatus(dragTaskId, col.key as "backlog" | "todo" | "in_progress" | "done");
+                      setDragTaskId(null);
+                    }}
+                  >
                     <div className="mb-2 flex items-center justify-between">
                       <p className="text-sm font-semibold text-gray-700 dark:text-gray-200">{col.label}</p>
                       <Badge variant="outline">{colTasks.length}</Badge>
@@ -1799,6 +1952,9 @@ export default function TasksPage() {
                         <button
                           key={task.id}
                           type="button"
+                          draggable
+                          onDragStart={() => setDragTaskId(task.id)}
+                          onDragEnd={() => setDragTaskId(null)}
                           onClick={() => setDetailTask(task)}
                           className="w-full rounded border border-gray-200 bg-white p-2 text-left hover:border-primary-400 dark:border-gray-700 dark:bg-gray-800"
                         >
@@ -1820,19 +1976,42 @@ export default function TasksPage() {
           )}
 
           {viewMode === "calendar" && (
-            <div className="space-y-2">
-              {filteredTasks
-                .filter((t) => !!t.due_date)
-                .sort((a, b) => new Date(a.due_date || "").getTime() - new Date(b.due_date || "").getTime())
-                .map((task) => (
-                  <div key={task.id} className="flex items-center justify-between rounded border border-gray-200 px-3 py-2 dark:border-gray-700">
-                    <div>
-                      <p className="font-semibold text-gray-900 dark:text-white">{task.title}</p>
-                      <p className="text-xs text-gray-500">{task.assigned_to || "Unassigned"} • {task.task_status || "todo"}</p>
-                    </div>
-                    <Badge variant="outline">{task.due_date ? formatDate(task.due_date) : "-"}</Badge>
+            <div className="space-y-3">
+              {Object.entries(
+                filteredTasks
+                  .filter((t) => !!t.due_date)
+                  .sort((a, b) => new Date(a.due_date || "").getTime() - new Date(b.due_date || "").getTime())
+                  .reduce((acc, task) => {
+                    const key = new Date(task.due_date || "").toISOString().slice(0, 10);
+                    if (!acc[key]) acc[key] = [] as Todo[];
+                    acc[key].push(task);
+                    return acc;
+                  }, {} as Record<string, Todo[]>)
+              ).map(([day, dayTasks]) => (
+                <div key={day} className="rounded border border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/30">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-sm font-semibold text-gray-900 dark:text-white">{formatDate(day)}</p>
+                    <Badge variant="outline">{dayTasks.length}</Badge>
                   </div>
-                ))}
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                    {dayTasks.map((task) => (
+                      <button
+                        key={task.id}
+                        type="button"
+                        onClick={() => setDetailTask(task)}
+                        className="rounded border border-gray-200 bg-white p-2 text-left hover:border-primary-400 dark:border-gray-700 dark:bg-gray-800"
+                      >
+                        <p className="font-semibold text-gray-900 dark:text-white">{task.title}</p>
+                        <p className="text-xs text-gray-500">{task.assigned_to || "Unassigned"} • {task.task_status || "todo"}</p>
+                        <div className="mt-1 flex items-center justify-between">
+                          <Badge variant="outline">{task.priority || "medium"}</Badge>
+                          <span className="text-xs text-gray-500">{task.due_date ? formatDate(task.due_date) : "--"}</span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
 
               {filteredTasks.filter((t) => !!t.due_date).length === 0 && (
                 <div className="rounded border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500 dark:border-gray-700">
@@ -2073,6 +2252,25 @@ export default function TasksPage() {
               </div>
             )}
 
+            <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+              <p className="mb-2 font-semibold">Comments</p>
+              <div className="max-h-40 space-y-1 overflow-y-auto">
+                {(detailTask.notes || "")
+                  .split("\n")
+                  .filter((line) => line.trim().startsWith("["))
+                  .slice()
+                  .reverse()
+                  .map((line, idx) => (
+                    <div key={`${idx}-${line.slice(0, 10)}`} className="rounded bg-gray-50 px-2 py-1 text-xs dark:bg-gray-800/60">
+                      {line}
+                    </div>
+                  ))}
+                {(detailTask.notes || "").split("\n").filter((line) => line.trim().startsWith("[")).length === 0 && (
+                  <p className="text-gray-500">No comments yet.</p>
+                )}
+              </div>
+            </div>
+
             {!!detailTask.decline_reason && (
               <div className="rounded border border-red-200 bg-red-50 p-2 text-sm dark:border-red-900 dark:bg-red-950/30">
                 <p className="font-semibold text-red-700 dark:text-red-300">Decline Reason</p>
@@ -2097,6 +2295,20 @@ export default function TasksPage() {
                 ))}
               </div>
             </div>
+
+            {parseJsonArray<AssignmentChainEntry>(detailTask.assignment_chain).length > 1 && (
+              <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+                <p className="mb-2 font-semibold">Multi-Assignment Progress</p>
+                <div className="space-y-1">
+                  {parseJsonArray<AssignmentChainEntry>(detailTask.assignment_chain).map((entry, idx) => (
+                    <div key={`multi-${entry.username}-${idx}`} className="flex items-center justify-between rounded bg-gray-50 px-2 py-1 text-xs dark:bg-gray-800/60">
+                      <span>{entry.username}</span>
+                      <Badge variant="outline">{entry.status || "pending"}</Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
               <p className="mb-2 font-semibold">Task History</p>
@@ -2125,7 +2337,25 @@ export default function TasksPage() {
                 {parseJsonArray<{ name?: string; size?: number; type?: string }>(detailTask.attachments || null).map((att, idx) => (
                   <div key={`${att.name || "file"}-${idx}`} className="flex items-center justify-between rounded border border-gray-200 px-2 py-1 text-xs dark:border-gray-700">
                     <span>{att.name || "file"}</span>
-                    <span className="text-gray-500">{att.size ? `${Math.ceil(att.size / 1024)} KB` : ""}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">{att.size ? `${Math.ceil(att.size / 1024)} KB` : ""}</span>
+                      <button
+                        type="button"
+                        className="text-primary-600 hover:text-primary-700 dark:text-primary-400"
+                        onClick={() => downloadAttachment(att)}
+                      >
+                        Download
+                      </button>
+                      {(detailTask.username === me || isAdminLike(currentUser)) && (
+                        <button
+                          type="button"
+                          className="text-red-600 hover:text-red-700 dark:text-red-400"
+                          onClick={() => deleteAttachment(att.name || "")}
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
