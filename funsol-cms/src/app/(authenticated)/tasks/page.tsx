@@ -100,6 +100,7 @@ type QuickFilter =
   | "approval_all";
 
 type ViewMode = "list" | "kanban" | "calendar";
+type ModulePanel = "workboard" | "queue" | "approval";
 
 type SmartList = "none" | "overdue" | "due_today" | "unassigned" | "queued" | "created_by_me";
 
@@ -113,12 +114,20 @@ type TaskForm = {
   app_name: string;
   package_name: string;
   kpi_type: string;
-  route_mode: "self" | "department" | "manager";
+  route_mode: "self" | "department" | "manager" | "multi";
   assigned_to: string;
+  assignees_csv: string;
   queue_department: string;
 };
 
+type TaskTemplate = {
+  id: string;
+  name: string;
+  form: TaskForm;
+};
+
 const FORM_DRAFT_KEY = "legacy_tasks_form_draft_v2";
+const TEMPLATE_KEY = "legacy_tasks_templates_v1";
 
 function parseCsv(value: string | null | undefined): string[] {
   if (!value) return [];
@@ -197,6 +206,7 @@ export default function TasksPage() {
   const [departmentFilter, setDepartmentFilter] = useState("all");
   const [sortBy, setSortBy] = useState("newest");
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [panel, setPanel] = useState<ModulePanel>("workboard");
   const [smartList, setSmartList] = useState<SmartList>("none");
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -215,6 +225,7 @@ export default function TasksPage() {
     kpi_type: "",
     route_mode: "self",
     assigned_to: "",
+    assignees_csv: "",
     queue_department: "",
   });
 
@@ -226,6 +237,9 @@ export default function TasksPage() {
   const [delegateTask, setDelegateTask] = useState<Todo | null>(null);
   const [delegateTarget, setDelegateTarget] = useState("");
   const [detailComment, setDetailComment] = useState("");
+  const [templates, setTemplates] = useState<TaskTemplate[]>([]);
+  const [templateName, setTemplateName] = useState("");
+  const [selectedTemplateId, setSelectedTemplateId] = useState("");
 
   const lowerMe = me.toLowerCase();
 
@@ -542,6 +556,21 @@ export default function TasksPage() {
     localStorage.setItem(FORM_DRAFT_KEY, JSON.stringify(form));
   }, [form, taskModalOpen]);
 
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(TEMPLATE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) setTemplates(parsed as TaskTemplate[]);
+    } catch {
+      // Ignore malformed template cache.
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templates));
+  }, [templates]);
+
   function resetForm() {
     setForm({
       title: "",
@@ -555,6 +584,7 @@ export default function TasksPage() {
       kpi_type: "",
       route_mode: "self",
       assigned_to: "",
+      assignees_csv: "",
       queue_department: "",
     });
     localStorage.removeItem(FORM_DRAFT_KEY);
@@ -579,6 +609,7 @@ export default function TasksPage() {
       kpi_type: task.kpi_type || "",
       route_mode: task.queue_department ? "department" : "self",
       assigned_to: task.assigned_to || "",
+      assignees_csv: "",
       queue_department: task.queue_department || "",
     });
     setEditingTask(task);
@@ -662,6 +693,30 @@ export default function TasksPage() {
       payload.category = "department";
     }
 
+    const extraAssignees: string[] = [];
+    if (form.route_mode === "multi") {
+      const all = parseCsv(form.assignees_csv)
+        .map((x) => x.toLowerCase())
+        .filter((x, i, arr) => arr.indexOf(x) === i);
+      if (all.length === 0) {
+        alert("Please add assignees for multi-routing");
+        return;
+      }
+      payload.assigned_to = all[0];
+      payload.manager_id = null;
+      payload.queue_department = null;
+      payload.queue_status = null;
+      payload.assignment_chain = JSON.stringify(
+        all.map((username) => ({
+          username,
+          role: "assignee",
+          status: username === all[0] ? "todo" : "pending",
+          timestamp: new Date().toISOString(),
+        }))
+      );
+      extraAssignees.push(...all.slice(1));
+    }
+
     setSaving(true);
     try {
       const method = editingTask ? "PATCH" : "POST";
@@ -678,6 +733,25 @@ export default function TasksPage() {
         throw new Error(err.error || "Could not save task");
       }
 
+      const createdOrUpdated = await res.json();
+
+      if (!editingTask && form.route_mode === "multi" && createdOrUpdated?.id && extraAssignees.length > 0) {
+        await Promise.all(
+          extraAssignees.map((username) =>
+            fetch("/api/todos/shares", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                todo_id: createdOrUpdated.id,
+                shared_with: username,
+                shared_by: me,
+                can_edit: true,
+              }),
+            })
+          )
+        );
+      }
+
       await refreshTasks();
       setTaskModalOpen(false);
       resetForm();
@@ -687,6 +761,55 @@ export default function TasksPage() {
       setSaving(false);
     }
   }
+
+  function saveTemplateFromForm() {
+    const name = templateName.trim();
+    if (!name) {
+      alert("Template name is required");
+      return;
+    }
+    const tpl: TaskTemplate = {
+      id: `${Date.now()}`,
+      name,
+      form,
+    };
+    setTemplates((prev) => [tpl, ...prev]);
+    setTemplateName("");
+  }
+
+  function applyTemplate() {
+    const tpl = templates.find((t) => t.id === selectedTemplateId);
+    if (!tpl) return;
+    setForm(tpl.form);
+    setTaskModalOpen(true);
+  }
+
+  function deleteTemplate(id: string) {
+    setTemplates((prev) => prev.filter((t) => t.id !== id));
+    if (selectedTemplateId === id) setSelectedTemplateId("");
+  }
+
+  const queueTasksByDept = useMemo(() => {
+    const map = new Map<string, Todo[]>();
+    visibleTasks
+      .filter((t) => !!t.queue_department && t.queue_status === "queued")
+      .forEach((task) => {
+        const key = (task.queue_department || "General").trim();
+        const current = map.get(key) || [];
+        current.push(task);
+        map.set(key, current);
+      });
+    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [visibleTasks]);
+
+  const approvalDeskTasks = useMemo(() => {
+    const isAdmin = isAdminLike(currentUser);
+    return visibleTasks.filter((task) => {
+      if (task.approval_status !== "pending_approval") return false;
+      if (isAdmin) return true;
+      return (task.username || "").toLowerCase() === lowerMe;
+    });
+  }, [visibleTasks, currentUser, lowerMe]);
 
   async function updateTask(id: string, updates: Record<string, unknown>) {
     const res = await fetch("/api/todos", {
@@ -993,6 +1116,9 @@ export default function TasksPage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <Button variant={panel === "workboard" ? "primary" : "outline"} onClick={() => setPanel("workboard")}>Workboard</Button>
+          <Button variant={panel === "queue" ? "primary" : "outline"} onClick={() => setPanel("queue")}>Queue Board</Button>
+          <Button variant={panel === "approval" ? "primary" : "outline"} onClick={() => setPanel("approval")}>Approval Desk</Button>
           <Button variant="outline" onClick={() => exportTasks("csv")}> <Download className="h-4 w-4" /> CSV </Button>
           <Button variant="outline" onClick={() => exportTasks("json")}> <Download className="h-4 w-4" /> JSON </Button>
           <Button onClick={openCreateModal}> <Plus className="h-4 w-4" /> New Task </Button>
@@ -1122,6 +1248,116 @@ export default function TasksPage() {
         </CardHeader>
 
         <CardContent className="space-y-3">
+          <div className="grid gap-2 rounded border border-gray-200 p-2 md:grid-cols-[1fr_220px_auto] dark:border-gray-700">
+            <Input placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />
+            <Select
+              value={selectedTemplateId}
+              onChange={(e) => setSelectedTemplateId(e.target.value)}
+              options={[
+                { value: "", label: "Select template" },
+                ...templates.map((t) => ({ value: t.id, label: t.name })),
+              ]}
+            />
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={saveTemplateFromForm}>Save Template</Button>
+              <Button variant="outline" onClick={applyTemplate}>Apply</Button>
+            </div>
+          </div>
+
+          {templates.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {templates.map((tpl) => (
+                <button
+                  key={tpl.id}
+                  type="button"
+                  onClick={() => setSelectedTemplateId(tpl.id)}
+                  className={`inline-flex items-center gap-2 rounded border px-2 py-1 text-xs ${
+                    selectedTemplateId === tpl.id
+                      ? "border-primary-500 bg-primary-50 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300"
+                      : "border-gray-300 text-gray-700 dark:border-gray-600 dark:text-gray-300"
+                  }`}
+                >
+                  {tpl.name}
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteTemplate(tpl.id);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        deleteTemplate(tpl.id);
+                      }
+                    }}
+                    className="rounded bg-red-100 px-1 text-red-600 dark:bg-red-900/40 dark:text-red-300"
+                  >
+                    x
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {panel === "queue" && (
+            <div className="space-y-3 rounded border border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/20">
+              {queueTasksByDept.length === 0 && (
+                <div className="rounded border border-dashed border-gray-300 p-6 text-center text-sm text-gray-500 dark:border-gray-700">
+                  No queued tasks available.
+                </div>
+              )}
+
+              {queueTasksByDept.map(([dept, deptTasks]) => (
+                <div key={dept} className="rounded border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="font-semibold text-gray-900 dark:text-white">{dept}</p>
+                    <Badge variant="outline">{deptTasks.length}</Badge>
+                  </div>
+                  <div className="space-y-2">
+                    {deptTasks.map((task) => (
+                      <div key={task.id} className="flex flex-wrap items-center justify-between gap-2 rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+                        <div>
+                          <p className="font-semibold text-gray-900 dark:text-white">{task.title}</p>
+                          <p className="text-xs text-gray-500">By {task.username} • Due {task.due_date ? formatDate(task.due_date) : "--"}</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="secondary" onClick={() => runTaskAction(task, "claim_queue")}>Pick Queue</Button>
+                          <Button size="sm" variant="outline" onClick={() => setDetailTask(task)}>Details</Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {panel === "approval" && (
+            <div className="space-y-2 rounded border border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/20">
+              {approvalDeskTasks.length === 0 && (
+                <div className="rounded border border-dashed border-gray-300 p-6 text-center text-sm text-gray-500 dark:border-gray-700">
+                  No tasks waiting for approval.
+                </div>
+              )}
+              {approvalDeskTasks.map((task) => (
+                <div key={task.id} className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-200 bg-white p-2 dark:border-amber-900/60 dark:bg-gray-800">
+                  <div>
+                    <p className="font-semibold text-gray-900 dark:text-white">{task.title}</p>
+                    <p className="text-xs text-gray-500">Submitted by {task.completed_by || task.assigned_to || "--"}</p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="success" onClick={() => runTaskAction(task, "approve")}>Approve</Button>
+                    <Button size="sm" variant="danger" onClick={() => { setDeclineTask(task); setDeclineReason(task.decline_reason || ""); }}>Decline</Button>
+                    <Button size="sm" variant="outline" onClick={() => setDetailTask(task)}>Details</Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {panel === "workboard" && (
+            <>
           <div className="flex flex-wrap gap-2 rounded border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-900/20">
             {[
               { key: "my_pending", label: "My Pending" },
@@ -1376,6 +1612,8 @@ export default function TasksPage() {
               )}
             </div>
           )}
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -1428,6 +1666,7 @@ export default function TasksPage() {
               { key: "self", label: "Self/User" },
               { key: "department", label: "Department Queue" },
               { key: "manager", label: "Manager" },
+              { key: "multi", label: "Multi-Assign" },
             ].map((opt) => (
               <button
                 key={opt.key}
@@ -1476,6 +1715,17 @@ export default function TasksPage() {
                 value={form.queue_department}
                 onChange={(e) => setForm((p) => ({ ...p, queue_department: e.target.value }))}
                 placeholder="e.g. SEO, PPC, Design"
+              />
+            </div>
+          )}
+
+          {form.route_mode === "multi" && (
+            <div className="mt-3">
+              <Input
+                label="Assignees (comma separated usernames)"
+                value={form.assignees_csv}
+                onChange={(e) => setForm((p) => ({ ...p, assignees_csv: e.target.value }))}
+                placeholder="user1, user2, user3"
               />
             </div>
           )}
