@@ -1,35 +1,34 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSession } from "next-auth/react";
 import {
-  Calendar,
+  CalendarDays,
   CheckCircle2,
-  ClipboardCheck,
   Clock3,
-  Play,
+  Columns3,
+  Download,
+  Eye,
+  Filter,
+  Kanban,
+  ListTodo,
+  Pencil,
   Plus,
+  Send,
   Share2,
-  ShieldCheck,
   Trash2,
   UserCheck,
-  Users,
   XCircle,
 } from "lucide-react";
-import { Avatar } from "@/components/ui/avatar";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Modal } from "@/components/ui/modal";
-import { SearchBar } from "@/components/ui/search-bar";
 import { Select } from "@/components/ui/select";
-import { TableSkeleton } from "@/components/ui/skeleton";
-import { toast } from "@/components/ui/toast";
-import { useAppStore } from "@/store";
-import { formatDate, formatDateTime, timeAgo } from "@/lib/utils";
-import type { TodoPriority, TodoStatus } from "@/types";
+import { Modal } from "@/components/ui/modal";
+import { formatDate } from "@/lib/utils";
 
-type UserRow = {
+type AppUser = {
   username: string;
   role: string;
   department: string | null;
@@ -37,112 +36,85 @@ type UserRow = {
   team_members: string | null;
 };
 
-type TodoRow = {
+type Todo = {
   id: string;
   title: string;
   description: string | null;
+  our_goal: string | null;
+  notes: string | null;
   username: string;
   assigned_to: string | null;
   manager_id: string | null;
-  status: TodoStatus;
-  task_status: string | null;
-  approval_status: string | null;
-  completed: boolean | null;
-  priority: TodoPriority;
+  task_status: "backlog" | "todo" | "in_progress" | "done" | null;
+  approval_status: "approved" | "pending_approval" | "declined" | null;
+  status: "open" | "in-progress" | "pending" | "approved" | "declined" | "completed" | null;
+  priority: "high" | "medium" | "low" | null;
   due_date: string | null;
-  expected_due_date: string | null;
-  actual_due_date: string | null;
+  completed: boolean | null;
+  completed_by: string | null;
   category: string | null;
-  tags: string | null;
-  notes: string | null;
-  our_goal: string | null;
   kpi_type: string | null;
+  app_name: string | null;
+  package_name: string | null;
+  archived: boolean | null;
   queue_department: string | null;
-  queue_status: string | null;
+  queue_status: "queued" | "claimed" | "completed" | null;
   created_at: string;
   updated_at: string | null;
-  completed_at: string | null;
-  completed_by: string | null;
-  approved_by: string | null;
-  approved_at: string | null;
-  declined_by: string | null;
-  declined_at: string | null;
-  decline_reason: string | null;
 };
 
-type TodoShareRow = {
-  id: string;
+type TodoShare = {
   todo_id: string;
-  shared_by: string;
   shared_with: string;
-  can_edit: boolean;
-  created_at: string;
 };
 
-type TaskTab = "my" | "assigned" | "team" | "shared" | "all";
+type QuickFilter =
+  | "my_pending"
+  | "my_all"
+  | "team_pending"
+  | "team_all"
+  | "all_pending"
+  | "all"
+  | "approval_pending"
+  | "approval_all";
+
+type ViewMode = "list" | "kanban" | "calendar";
 
 type TaskForm = {
   title: string;
   description: string;
-  priority: TodoPriority;
-  due_date: string;
-  expected_due_date: string;
-  assigned_to: string;
-  category: string;
-  tags: string;
-  notes: string;
   our_goal: string;
+  notes: string;
+  priority: "high" | "medium" | "low";
+  due_date: string;
+  app_name: string;
+  package_name: string;
   kpi_type: string;
+  route_mode: "self" | "department" | "manager";
+  assigned_to: string;
   queue_department: string;
 };
 
-const defaultForm: TaskForm = {
-  title: "",
-  description: "",
-  priority: "medium",
-  due_date: "",
-  expected_due_date: "",
-  assigned_to: "",
-  category: "",
-  tags: "",
-  notes: "",
-  our_goal: "",
-  kpi_type: "",
-  queue_department: "",
-};
+const FORM_DRAFT_KEY = "legacy_tasks_form_draft_v2";
 
-const statusFilterOptions = [
-  { value: "", label: "All Status" },
-  { value: "open", label: "Open" },
-  { value: "in_progress", label: "In Progress" },
-  { value: "pending_approval", label: "Pending Approval" },
-  { value: "approved", label: "Approved" },
-  { value: "declined", label: "Declined" },
-  { value: "completed", label: "Completed" },
-];
-
-const priorityFilterOptions = [
-  { value: "", label: "All Priority" },
-  { value: "high", label: "High" },
-  { value: "medium", label: "Medium" },
-  { value: "low", label: "Low" },
-];
-
-function parseCsv(raw: string | null | undefined): string[] {
-  if (!raw) return [];
-  return raw
+function parseCsv(value: string | null | undefined): string[] {
+  if (!value) return [];
+  return value
     .split(",")
-    .map((x) => x.trim())
+    .map((item) => item.trim())
     .filter(Boolean);
 }
 
-function isInManagerList(managerField: string | null | undefined, username: string): boolean {
-  if (!managerField) return false;
-  const me = username.toLowerCase();
-  return parseCsv(managerField).some((m) => m.toLowerCase() === me);
+function isAdminLike(user: AppUser | null): boolean {
+  if (!user) return false;
+  return user.username === "admin" || user.role === "Admin" || user.role === "Super Manager";
 }
 
-function isDoneTask(task: TodoRow): boolean {
+function isManager(user: AppUser | null): boolean {
+  return !!user && user.role === "Manager";
+}
+
+function isDone(task: Todo): boolean {
   return (
     task.completed === true ||
     task.task_status === "done" ||
@@ -151,497 +123,598 @@ function isDoneTask(task: TodoRow): boolean {
   );
 }
 
-function getUnifiedStatus(task: TodoRow): string {
-  if (task.approval_status === "pending_approval") return "pending_approval";
-  if (task.approval_status === "approved") return "approved";
-  if (task.approval_status === "declined") return "declined";
-  if (task.task_status === "in_progress") return "in_progress";
-  if (isDoneTask(task)) return "completed";
-  return task.status || "open";
+function isPending(task: Todo): boolean {
+  return !isDone(task) && (task.approval_status === "pending_approval" || task.status === "pending");
 }
 
-function isOverdue(task: TodoRow): boolean {
-  if (!task.due_date || isDoneTask(task)) return false;
-  return new Date(task.due_date).getTime() < Date.now();
+function toInputDateTime(value: string | null): string {
+  if (!value) return "";
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
 }
 
-function statusBadgeVariant(status: string): "default" | "success" | "warning" | "danger" | "info" | "outline" {
-  if (status === "completed" || status === "approved") return "success";
-  if (status === "pending_approval") return "warning";
-  if (status === "declined") return "danger";
-  if (status === "in_progress") return "info";
-  return "default";
+function startOfDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
 }
 
-function priorityBadgeVariant(priority: string): "default" | "success" | "warning" | "danger" | "info" | "outline" {
-  if (priority === "high") return "danger";
-  if (priority === "medium") return "warning";
-  return "default";
+function endOfDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
 }
 
 export default function TasksPage() {
-  const currentUser = useAppStore((s) => s.user);
-  const [users, setUsers] = useState<UserRow[]>([]);
-  const [todos, setTodos] = useState<TodoRow[]>([]);
-  const [shares, setShares] = useState<TodoShareRow[]>([]);
+  const { data: session } = useSession();
+  const me = (session?.user as { username?: string } | undefined)?.username || "";
+
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<TaskTab>("my");
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
-  const [priorityFilter, setPriorityFilter] = useState("");
-
-  const [formOpen, setFormOpen] = useState(false);
-  const [editTaskId, setEditTaskId] = useState<string | null>(null);
-  const [formData, setFormData] = useState<TaskForm>(defaultForm);
   const [saving, setSaving] = useState(false);
+  const [users, setUsers] = useState<AppUser[]>([]);
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  const [tasks, setTasks] = useState<Todo[]>([]);
+  const [sharedTaskIds, setSharedTaskIds] = useState<Set<string>>(new Set());
 
-  const [detailTask, setDetailTask] = useState<TodoRow | null>(null);
-  const [deleteTask, setDeleteTask] = useState<TodoRow | null>(null);
+  const [search, setSearch] = useState("");
+  const [quickFilter, setQuickFilter] = useState<QuickFilter>("my_pending");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [priorityFilter, setPriorityFilter] = useState("all");
+  const [dateFilter, setDateFilter] = useState("all");
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
+  const [departmentFilter, setDepartmentFilter] = useState("all");
+  const [sortBy, setSortBy] = useState("newest");
+  const [viewMode, setViewMode] = useState<ViewMode>("list");
 
-  const [shareModalOpen, setShareModalOpen] = useState(false);
-  const [shareTask, setShareTask] = useState<TodoRow | null>(null);
-  const [shareUsername, setShareUsername] = useState("");
-  const [shareCanEdit, setShareCanEdit] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  const [declineModalOpen, setDeclineModalOpen] = useState(false);
-  const [declineTask, setDeclineTask] = useState<TodoRow | null>(null);
-  const [declineReason, setDeclineReason] = useState("");
+  const [taskModalOpen, setTaskModalOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Todo | null>(null);
+  const [form, setForm] = useState<TaskForm>({
+    title: "",
+    description: "",
+    our_goal: "",
+    notes: "",
+    priority: "medium",
+    due_date: "",
+    app_name: "",
+    package_name: "",
+    kpi_type: "",
+    route_mode: "self",
+    assigned_to: "",
+    queue_department: "",
+  });
 
-  const me = (currentUser?.username || "").toLowerCase();
-  const isAdminOrSuper = currentUser?.username === "admin" || currentUser?.role === "Admin" || currentUser?.role === "Super Manager";
-  const isManager = currentUser?.role === "Manager";
+  const [detailTask, setDetailTask] = useState<Todo | null>(null);
+  const [shareTask, setShareTask] = useState<Todo | null>(null);
+  const [shareTarget, setShareTarget] = useState("");
 
-  const explicitTeamMembers = useMemo(() => {
-    return parseCsv(currentUser?.teamMembers).map((u) => u.toLowerCase());
-  }, [currentUser?.teamMembers]);
-
-  const reverseTeamMembers = useMemo(() => {
-    if (!currentUser?.username) return [];
-    const meName = currentUser.username;
-    return users
-      .filter((u) => isInManagerList(u.manager_id, meName))
-      .map((u) => (u.username || "").toLowerCase());
-  }, [users, currentUser?.username]);
-
-  const teamSet = useMemo(() => {
-    return new Set([...explicitTeamMembers, ...reverseTeamMembers]);
-  }, [explicitTeamMembers, reverseTeamMembers]);
-
-  const sharesForMe = useMemo(() => {
-    return shares.filter((s) => (s.shared_with || "").toLowerCase() === me);
-  }, [shares, me]);
-
-  const shareMapByTodo = useMemo(() => {
-    const map = new Map<string, TodoShareRow[]>();
-    shares.forEach((s) => {
-      const list = map.get(s.todo_id) || [];
-      list.push(s);
-      map.set(s.todo_id, list);
-    });
-    return map;
-  }, [shares]);
-
-  const canViewTask = useCallback((task: TodoRow) => {
-    const owner = (task.username || "").toLowerCase();
-    const assignee = (task.assigned_to || "").toLowerCase();
-    const completedBy = (task.completed_by || "").toLowerCase();
-
-    if (isAdminOrSuper) return true;
-    if (owner === me || assignee === me || completedBy === me) return true;
-    if (isInManagerList(task.manager_id, currentUser?.username || "")) return true;
-
-    const shared = shareMapByTodo.get(task.id) || [];
-    if (shared.some((s) => (s.shared_with || "").toLowerCase() === me)) return true;
-
-    if (isManager && (teamSet.has(owner) || teamSet.has(assignee))) return true;
-
-    return false;
-  }, [currentUser?.username, isAdminOrSuper, isManager, me, shareMapByTodo, teamSet]);
-
-  const canEditTask = useCallback((task: TodoRow) => {
-    const owner = (task.username || "").toLowerCase();
-    if (isAdminOrSuper || owner === me) return true;
-
-    const shared = shareMapByTodo.get(task.id) || [];
-    if (shared.some((s) => (s.shared_with || "").toLowerCase() === me && s.can_edit)) return true;
-
-    if (isManager) {
-      const assignee = (task.assigned_to || "").toLowerCase();
-      if (teamSet.has(assignee) || teamSet.has(owner)) return true;
-      if (isInManagerList(task.manager_id, currentUser?.username || "")) return true;
-    }
-
-    return false;
-  }, [currentUser?.username, isAdminOrSuper, isManager, me, shareMapByTodo, teamSet]);
-
-  const canDeleteTask = useCallback((task: TodoRow) => {
-    const owner = (task.username || "").toLowerCase();
-    if (isAdminOrSuper) return true;
-    return owner === me;
-  }, [isAdminOrSuper, me]);
-
-  const loadAll = useCallback(async () => {
-    if (!currentUser?.username) return;
-    setLoading(true);
-    try {
-      const [usersRes, todosRes, sharesRes] = await Promise.all([
-        fetch("/api/users"),
-        fetch("/api/todos"),
-        fetch("/api/todos/shares"),
-      ]);
-
-      const [usersData, todosData, sharesData] = await Promise.all([
-        usersRes.json(),
-        todosRes.json(),
-        sharesRes.json(),
-      ]);
-
-      if (!usersRes.ok) throw new Error(usersData?.error || "Failed to load users");
-      if (!todosRes.ok) throw new Error(todosData?.error || "Failed to load todos");
-      if (!sharesRes.ok) throw new Error(sharesData?.error || "Failed to load shares");
-
-      setUsers(usersData || []);
-      setTodos((todosData || []).filter((t: TodoRow) => !!t.id));
-      setShares(sharesData || []);
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Failed to load tasks module data");
-    } finally {
-      setLoading(false);
-    }
-  }, [currentUser?.username]);
+  const lowerMe = me.toLowerCase();
 
   useEffect(() => {
-    loadAll();
-  }, [loadAll]);
+    async function load() {
+      if (!me) {
+        setLoading(false);
+        return;
+      }
 
-  const visibleTodos = useMemo(() => {
-    const scoped = todos.filter((t) => canViewTask(t));
+      try {
+        const [userRes, usersRes, todoRes, shareRes] = await Promise.all([
+          fetch(`/api/users?username=${encodeURIComponent(me)}`, { cache: "no-store" }),
+          fetch("/api/users", { cache: "no-store" }),
+          fetch("/api/todos", { cache: "no-store" }),
+          fetch(`/api/todos/shares?shared_with=${encodeURIComponent(me)}`, { cache: "no-store" }),
+        ]);
 
-    if (tab === "my") return scoped.filter((t) => (t.username || "").toLowerCase() === me);
-    if (tab === "assigned") return scoped.filter((t) => (t.assigned_to || "").toLowerCase() === me);
-    if (tab === "team") return scoped.filter((t) => {
-      const owner = (t.username || "").toLowerCase();
-      const assignee = (t.assigned_to || "").toLowerCase();
-      return teamSet.has(owner) || teamSet.has(assignee) || isInManagerList(t.manager_id, currentUser?.username || "");
-    });
-    if (tab === "shared") {
-      const sharedIds = new Set(sharesForMe.map((s) => s.todo_id));
-      return scoped.filter((t) => sharedIds.has(t.id));
+        if (!userRes.ok || !usersRes.ok || !todoRes.ok || !shareRes.ok) {
+          throw new Error("Failed to load data");
+        }
+
+        const userJson = await userRes.json();
+        const usersJson = await usersRes.json();
+        const todoJson = await todoRes.json();
+        const shareJson = await shareRes.json();
+
+        const meRow = Array.isArray(userJson) ? userJson[0] : userJson;
+        const allUsers = Array.isArray(usersJson) ? usersJson : [];
+        const allTasks = Array.isArray(todoJson) ? (todoJson as Todo[]) : [];
+        const shares = Array.isArray(shareJson) ? (shareJson as TodoShare[]) : [];
+
+        const meNormalized: AppUser | null = meRow
+          ? {
+              username: meRow.username,
+              role: meRow.role,
+              department: meRow.department || null,
+              manager_id: meRow.manager_id || null,
+              team_members: meRow.team_members || null,
+            }
+          : null;
+
+        const normalizedUsers: AppUser[] = allUsers.map((u: any) => ({
+          username: u.username,
+          role: u.role,
+          department: u.department || null,
+          manager_id: u.manager_id || null,
+          team_members: u.team_members || null,
+        }));
+
+        setCurrentUser(meNormalized);
+        setUsers(normalizedUsers);
+        setTasks(allTasks);
+        setSharedTaskIds(new Set(shares.map((s) => s.todo_id)));
+
+        if (meNormalized) {
+          if (isAdminLike(meNormalized)) {
+            setQuickFilter("all");
+          } else if (isManager(meNormalized)) {
+            setQuickFilter("team_pending");
+          } else {
+            setQuickFilter("my_pending");
+          }
+
+          const draftRaw = localStorage.getItem(FORM_DRAFT_KEY);
+          if (draftRaw) {
+            try {
+              const draft = JSON.parse(draftRaw) as Partial<TaskForm>;
+              setForm((prev) => ({ ...prev, ...draft }));
+            } catch {
+              // Ignore invalid draft JSON
+            }
+          }
+        }
+      } catch {
+        alert("Could not load tasks module data");
+      } finally {
+        setLoading(false);
+      }
     }
 
-    return isAdminOrSuper || isManager ? scoped : scoped.filter((t) => (t.username || "").toLowerCase() === me);
-  }, [todos, tab, canViewTask, me, teamSet, sharesForMe, isAdminOrSuper, isManager, currentUser?.username]);
+    load();
+  }, [me]);
 
-  const filteredTodos = useMemo(() => {
-    return visibleTodos.filter((t) => {
-      const status = getUnifiedStatus(t);
-      const searchMatch = !search || [t.title, t.description, t.category, t.tags, t.username, t.assigned_to].join(" ").toLowerCase().includes(search.toLowerCase());
-      const statusMatch = !statusFilter || status === statusFilter;
-      const priorityMatch = !priorityFilter || t.priority === priorityFilter;
-      return searchMatch && statusMatch && priorityMatch;
+  const managerTeam = useMemo(() => {
+    if (!currentUser) return new Set<string>();
+    const team = new Set<string>(parseCsv(currentUser.team_members).map((u) => u.toLowerCase()));
+    const meLower = currentUser.username.toLowerCase();
+
+    users.forEach((u) => {
+      if (parseCsv(u.manager_id).some((m) => m.toLowerCase() === meLower)) {
+        team.add(u.username.toLowerCase());
+      }
     });
-  }, [visibleTodos, search, statusFilter, priorityFilter]);
 
-  const tabCounts = useMemo(() => {
-    const scoped = todos.filter((t) => canViewTask(t));
-    return {
-      my: scoped.filter((t) => (t.username || "").toLowerCase() === me).length,
-      assigned: scoped.filter((t) => (t.assigned_to || "").toLowerCase() === me).length,
-      team: scoped.filter((t) => {
-        const owner = (t.username || "").toLowerCase();
-        const assignee = (t.assigned_to || "").toLowerCase();
-        return teamSet.has(owner) || teamSet.has(assignee) || isInManagerList(t.manager_id, currentUser?.username || "");
-      }).length,
-      shared: scoped.filter((t) => sharesForMe.some((s) => s.todo_id === t.id)).length,
-      all: scoped.length,
-    };
-  }, [todos, canViewTask, me, teamSet, currentUser?.username, sharesForMe]);
+    return team;
+  }, [currentUser, users]);
 
-  const openCreate = () => {
-    setEditTaskId(null);
-    setFormData(defaultForm);
-    setFormOpen(true);
-  };
+  const visibleTasks = useMemo(() => {
+    if (!currentUser) return [];
 
-  const openEdit = (task: TodoRow) => {
-    if (!canEditTask(task)) {
-      toast("error", "You do not have permission to edit this task");
-      return;
-    }
+    const isAdmin = isAdminLike(currentUser);
+    const canManagerSee = isManager(currentUser);
 
-    setEditTaskId(task.id);
-    setFormData({
+    return tasks.filter((task) => {
+      if (task.archived) return false;
+      if (isAdmin) return true;
+
+      const owner = (task.username || "").toLowerCase();
+      const assignee = (task.assigned_to || "").toLowerCase();
+
+      if (owner === lowerMe || assignee === lowerMe) return true;
+      if (sharedTaskIds.has(task.id)) return true;
+
+      if (canManagerSee && (managerTeam.has(owner) || managerTeam.has(assignee))) return true;
+      if (canManagerSee && parseCsv(task.manager_id).some((m) => m.toLowerCase() === lowerMe)) return true;
+
+      return false;
+    });
+  }, [tasks, currentUser, lowerMe, managerTeam, sharedTaskIds]);
+
+  const filteredTasks = useMemo(() => {
+    const now = new Date();
+    const todayStart = startOfDay(now);
+    const todayEnd = endOfDay(now);
+
+    const scoped = visibleTasks.filter((task) => {
+      const owner = (task.username || "").toLowerCase();
+      const assignee = (task.assigned_to || "").toLowerCase();
+      const isMine = owner === lowerMe || assignee === lowerMe;
+      const isTeamTask = managerTeam.has(owner) || managerTeam.has(assignee);
+      const pendingApproval = isPending(task);
+
+      if (quickFilter === "my_pending" && (!isMine || isDone(task))) return false;
+      if (quickFilter === "my_all" && !isMine) return false;
+      if (quickFilter === "team_pending" && (!isTeamTask || isDone(task))) return false;
+      if (quickFilter === "team_all" && !isTeamTask) return false;
+      if (quickFilter === "all_pending" && isDone(task)) return false;
+      if (quickFilter === "approval_pending" && !pendingApproval) return false;
+      if (quickFilter === "approval_all" && !(task.approval_status || "").includes("approval")) return false;
+
+      if (statusFilter !== "all") {
+        if (statusFilter === "pending_approval") {
+          if (!pendingApproval) return false;
+        } else if ((task.task_status || "") !== statusFilter) {
+          return false;
+        }
+      }
+
+      if (priorityFilter !== "all" && task.priority !== priorityFilter) return false;
+
+      if (assigneeFilter !== "all") {
+        const selected = assigneeFilter.toLowerCase();
+        if (((task.assigned_to || "").toLowerCase() !== selected) && ((task.username || "").toLowerCase() !== selected)) {
+          return false;
+        }
+      }
+
+      if (departmentFilter !== "all") {
+        if ((task.queue_department || "").toLowerCase() !== departmentFilter.toLowerCase()) {
+          return false;
+        }
+      }
+
+      if (dateFilter !== "all") {
+        const due = task.due_date ? new Date(task.due_date) : null;
+        if (!due || Number.isNaN(due.getTime())) return false;
+
+        if (dateFilter === "today" && (due < todayStart || due > todayEnd)) return false;
+        if (dateFilter === "overdue" && !(due < todayStart && !isDone(task))) return false;
+        if (dateFilter === "next7") {
+          const next7 = new Date(now);
+          next7.setDate(now.getDate() + 7);
+          if (!(due >= todayStart && due <= endOfDay(next7))) return false;
+        }
+      }
+
+      if (search.trim()) {
+        const q = search.toLowerCase();
+        const text = [
+          task.title,
+          task.description || "",
+          task.our_goal || "",
+          task.notes || "",
+          task.assigned_to || "",
+          task.username || "",
+          task.app_name || "",
+          task.package_name || "",
+        ]
+          .join(" ")
+          .toLowerCase();
+
+        if (!text.includes(q)) return false;
+      }
+
+      return true;
+    });
+
+    const sorted = [...scoped];
+    sorted.sort((a, b) => {
+      if (sortBy === "newest") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      if (sortBy === "oldest") return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      if (sortBy === "due_soon") {
+        const da = a.due_date ? new Date(a.due_date).getTime() : Number.MAX_SAFE_INTEGER;
+        const db = b.due_date ? new Date(b.due_date).getTime() : Number.MAX_SAFE_INTEGER;
+        return da - db;
+      }
+      if (sortBy === "priority") {
+        const rank = { high: 0, medium: 1, low: 2 } as const;
+        const pa = rank[(a.priority || "medium") as keyof typeof rank] ?? 1;
+        const pb = rank[(b.priority || "medium") as keyof typeof rank] ?? 1;
+        return pa - pb;
+      }
+      return 0;
+    });
+
+    return sorted;
+  }, [visibleTasks, quickFilter, statusFilter, priorityFilter, dateFilter, assigneeFilter, departmentFilter, search, sortBy, lowerMe, managerTeam]);
+
+  const kpis = useMemo(() => {
+    const total = visibleTasks.length;
+    const mine = visibleTasks.filter((t) => (t.assigned_to || "").toLowerCase() === lowerMe).length;
+    const complete = visibleTasks.filter((t) => isDone(t)).length;
+    const pendingApproval = visibleTasks.filter((t) => isPending(t)).length;
+    const inProgress = visibleTasks.filter((t) => t.task_status === "in_progress").length;
+    const today = startOfDay(new Date());
+    const overdue = visibleTasks.filter((t) => t.due_date && new Date(t.due_date) < today && !isDone(t)).length;
+
+    return [
+      { title: "Total Tasks", value: total, icon: <ListTodo className="h-5 w-5" /> },
+      { title: "Assigned To Me", value: mine, icon: <UserCheck className="h-5 w-5" /> },
+      { title: "Completed", value: complete, icon: <CheckCircle2 className="h-5 w-5" /> },
+      { title: "In Progress", value: inProgress, icon: <Clock3 className="h-5 w-5" /> },
+      { title: "Pending Approval", value: pendingApproval, icon: <Send className="h-5 w-5" /> },
+      { title: "Overdue", value: overdue, icon: <XCircle className="h-5 w-5" /> },
+    ];
+  }, [visibleTasks, lowerMe]);
+
+  const assigneeOptions = useMemo(() => {
+    const set = new Set<string>();
+    visibleTasks.forEach((t) => {
+      if (t.assigned_to) set.add(t.assigned_to);
+      if (t.username) set.add(t.username);
+    });
+
+    return [
+      { value: "all", label: "All People" },
+      ...Array.from(set)
+        .sort((a, b) => a.localeCompare(b))
+        .map((u) => ({ value: u, label: u })),
+    ];
+  }, [visibleTasks]);
+
+  const departmentOptions = useMemo(() => {
+    const set = new Set<string>();
+    users.forEach((u) => {
+      if (u.department) set.add(u.department);
+    });
+
+    return [
+      { value: "all", label: "All Departments" },
+      ...Array.from(set)
+        .sort((a, b) => a.localeCompare(b))
+        .map((d) => ({ value: d, label: d })),
+    ];
+  }, [users]);
+
+  const managerOptions = useMemo(() => {
+    return users
+      .filter((u) => ["Manager", "Super Manager", "Admin"].includes(u.role))
+      .map((u) => ({ value: u.username, label: `${u.username} (${u.role})` }));
+  }, [users]);
+
+  useEffect(() => {
+    if (!taskModalOpen) return;
+    localStorage.setItem(FORM_DRAFT_KEY, JSON.stringify(form));
+  }, [form, taskModalOpen]);
+
+  function resetForm() {
+    setForm({
+      title: "",
+      description: "",
+      our_goal: "",
+      notes: "",
+      priority: "medium",
+      due_date: "",
+      app_name: "",
+      package_name: "",
+      kpi_type: "",
+      route_mode: "self",
+      assigned_to: "",
+      queue_department: "",
+    });
+    localStorage.removeItem(FORM_DRAFT_KEY);
+  }
+
+  function openCreateModal() {
+    setEditingTask(null);
+    setTaskModalOpen(true);
+  }
+
+  function openEditModal(task: Todo) {
+    setEditingTask(task);
+    setForm({
       title: task.title || "",
       description: task.description || "",
-      priority: task.priority || "medium",
-      due_date: task.due_date ? task.due_date.slice(0, 10) : "",
-      expected_due_date: task.expected_due_date ? task.expected_due_date.slice(0, 10) : "",
-      assigned_to: task.assigned_to || "",
-      category: task.category || "",
-      tags: task.tags || "",
-      notes: task.notes || "",
       our_goal: task.our_goal || "",
+      notes: task.notes || "",
+      priority: task.priority || "medium",
+      due_date: toInputDateTime(task.due_date),
+      app_name: task.app_name || "",
+      package_name: task.package_name || "",
       kpi_type: task.kpi_type || "",
+      route_mode: task.queue_department ? "department" : "self",
+      assigned_to: task.assigned_to || "",
       queue_department: task.queue_department || "",
     });
-    setFormOpen(true);
-  };
+    setEditingTask(task);
+    setTaskModalOpen(true);
+  }
 
-  const saveTask = async () => {
-    if (!currentUser?.username) return;
-    if (!formData.title.trim()) {
-      toast("error", "Task title is required");
+  async function refreshTasks() {
+    const [todoRes, shareRes] = await Promise.all([
+      fetch("/api/todos", { cache: "no-store" }),
+      fetch(`/api/todos/shares?shared_with=${encodeURIComponent(me)}`, { cache: "no-store" }),
+    ]);
+
+    const todoJson = await todoRes.json();
+    const shareJson = await shareRes.json();
+
+    setTasks(Array.isArray(todoJson) ? todoJson : []);
+    setSharedTaskIds(new Set(Array.isArray(shareJson) ? shareJson.map((s: TodoShare) => s.todo_id) : []));
+  }
+
+  async function submitTask() {
+    if (!form.title.trim()) {
+      alert("Task subject is required");
       return;
+    }
+
+    if (!form.due_date) {
+      alert("Due date is required");
+      return;
+    }
+
+    const due = new Date(form.due_date);
+    if (Number.isNaN(due.getTime())) {
+      alert("Please enter a valid due date");
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
+      title: form.title.trim(),
+      description: form.description.trim() || null,
+      our_goal: form.our_goal.trim() || null,
+      notes: form.notes.trim() || null,
+      priority: form.priority,
+      due_date: due.toISOString(),
+      app_name: form.app_name.trim() || null,
+      package_name: form.package_name.trim() || null,
+      kpi_type: form.kpi_type.trim() || null,
+      username: me,
+      status: "open",
+      task_status: "backlog",
+      approval_status: "approved",
+      category: "general",
+    };
+
+    if (form.route_mode === "self") {
+      payload.assigned_to = form.assigned_to || me;
+      payload.manager_id = currentUser?.manager_id || null;
+      payload.queue_department = null;
+      payload.queue_status = null;
+    }
+
+    if (form.route_mode === "manager") {
+      if (!form.assigned_to) {
+        alert("Please choose a manager");
+        return;
+      }
+      payload.assigned_to = form.assigned_to;
+      payload.manager_id = form.assigned_to;
+      payload.queue_department = null;
+      payload.queue_status = null;
+    }
+
+    if (form.route_mode === "department") {
+      if (!form.queue_department.trim()) {
+        alert("Please enter queue department");
+        return;
+      }
+      payload.assigned_to = null;
+      payload.manager_id = null;
+      payload.queue_department = form.queue_department.trim();
+      payload.queue_status = "queued";
+      payload.category = "department";
     }
 
     setSaving(true);
     try {
-      const now = new Date().toISOString();
-      const payload: Partial<TodoRow> & { title: string } = {
-        title: formData.title.trim(),
-        description: formData.description.trim() || null,
-        priority: formData.priority,
-        due_date: formData.due_date || null,
-        expected_due_date: formData.expected_due_date || null,
-        assigned_to: formData.assigned_to || null,
-        category: formData.category.trim() || null,
-        tags: formData.tags.trim() || null,
-        notes: formData.notes.trim() || null,
-        our_goal: formData.our_goal.trim() || null,
-        kpi_type: formData.kpi_type.trim() || null,
-        queue_department: formData.queue_department.trim() || null,
-        updated_at: now,
-      };
+      const method = editingTask ? "PATCH" : "POST";
+      const body = editingTask ? { ...payload, id: editingTask.id } : payload;
 
-      if (!editTaskId) {
-        Object.assign(payload, {
-          username: currentUser.username,
-          status: "open",
-          task_status: formData.assigned_to ? "backlog" : "todo",
-          completed: false,
-          approval_status: "approved",
-          created_at: now,
-          manager_id: null,
-          queue_status: formData.queue_department ? "queued" : null,
-        });
+      const res = await fetch("/api/todos", {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Could not save task");
       }
 
-      if (formData.assigned_to) {
-        const assignee = users.find((u) => u.username === formData.assigned_to);
-        Object.assign(payload, {
-          manager_id: assignee?.manager_id || null,
-          queue_status: null,
-        });
-      }
-
-      if (editTaskId) {
-        const original = todos.find((t) => t.id === editTaskId);
-        if (!original || !canEditTask(original)) {
-          throw new Error("You do not have permission to edit this task");
-        }
-
-        const res = await fetch("/api/todos", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: editTaskId, ...payload }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data?.error || "Failed to update task");
-        toast("success", "Task updated");
-      } else {
-        const res = await fetch("/api/todos", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data?.error || "Failed to create task");
-        toast("success", "Task created");
-      }
-
-      setFormOpen(false);
-      await loadAll();
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Failed to save task");
+      await refreshTasks();
+      setTaskModalOpen(false);
+      resetForm();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Failed to save task");
     } finally {
       setSaving(false);
     }
-  };
+  }
 
-  const removeTask = async () => {
-    if (!deleteTask) return;
-    if (!canDeleteTask(deleteTask)) {
-      toast("error", "You do not have permission to delete this task");
-      return;
+  async function updateTask(id: string, updates: Record<string, unknown>) {
+    const res = await fetch("/api/todos", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...updates }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || "Failed to update task");
     }
+  }
 
+  async function runTaskAction(task: Todo, action: "start" | "submit" | "approve" | "decline" | "reopen" | "claim_queue") {
     try {
-      const res = await fetch(`/api/todos?id=${encodeURIComponent(deleteTask.id)}`, { method: "DELETE" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "Failed to delete task");
-
-      toast("success", "Task deleted");
-      setDeleteTask(null);
-      setDetailTask(null);
-      await loadAll();
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Delete failed");
-    }
-  };
-
-  const updateTaskWorkflow = async (task: TodoRow, mode: "start" | "submit" | "approve" | "decline" | "reopen") => {
-    if (!currentUser?.username) return;
-
-    const isOwner = (task.username || "").toLowerCase() === me;
-    const isAssignee = (task.assigned_to || "").toLowerCase() === me;
-
-    let patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
-
-    if (mode === "start") {
-      if (!isAssignee && !isOwner && !isAdminOrSuper) {
-        toast("error", "Only assignee can start this task");
-        return;
-      }
-      patch = {
-        ...patch,
-        task_status: "in_progress",
-        status: "in-progress",
-      };
-    }
-
-    if (mode === "submit") {
-      if (!isAssignee && !isOwner && !isAdminOrSuper) {
-        toast("error", "Only assignee can submit completion");
-        return;
+      if (action === "start") {
+        await updateTask(task.id, { task_status: "in_progress", status: "in-progress" });
       }
 
-      if (isOwner || isAdminOrSuper) {
-        patch = {
-          ...patch,
-          completed: true,
-          completed_at: new Date().toISOString(),
-          completed_by: currentUser.username,
+      if (action === "submit") {
+        const creator = (task.username || "").toLowerCase();
+        const mine = creator === lowerMe;
+
+        if (mine) {
+          await updateTask(task.id, {
+            task_status: "done",
+            status: "completed",
+            approval_status: "approved",
+            completed: true,
+            completed_by: me,
+          });
+        } else {
+          await updateTask(task.id, {
+            task_status: "done",
+            status: "pending",
+            approval_status: "pending_approval",
+            completed: false,
+            completed_by: me,
+          });
+        }
+      }
+
+      if (action === "approve") {
+        await updateTask(task.id, {
           approval_status: "approved",
+          status: "approved",
+          completed: true,
           task_status: "done",
-          status: "completed",
-        };
-      } else {
-        patch = {
-          ...patch,
+        });
+      }
+
+      if (action === "decline") {
+        await updateTask(task.id, {
+          approval_status: "declined",
+          status: "declined",
           completed: false,
-          completed_by: currentUser.username,
-          approval_status: "pending_approval",
           task_status: "in_progress",
-          status: "pending",
-        };
+        });
       }
-    }
 
-    if (mode === "approve") {
-      if (!isOwner && !isAdminOrSuper) {
-        toast("error", "Only creator can approve completion");
-        return;
+      if (action === "reopen") {
+        await updateTask(task.id, {
+          approval_status: "approved",
+          status: "open",
+          completed: false,
+          task_status: "todo",
+        });
       }
-      patch = {
-        ...patch,
-        completed: true,
-        completed_at: new Date().toISOString(),
-        approval_status: "approved",
-        approved_by: currentUser.username,
-        approved_at: new Date().toISOString(),
-        task_status: "done",
-        status: "completed",
-      };
-    }
 
-    if (mode === "decline") {
-      if (!isOwner && !isAdminOrSuper) {
-        toast("error", "Only creator can decline completion");
-        return;
+      if (action === "claim_queue") {
+        await updateTask(task.id, {
+          assigned_to: me,
+          queue_status: "claimed",
+          task_status: "todo",
+        });
       }
-      setDeclineTask(task);
-      setDeclineReason("");
-      setDeclineModalOpen(true);
-      return;
-    }
 
-    if (mode === "reopen") {
-      if (!isOwner && !isAdminOrSuper) {
-        toast("error", "Only creator can reopen task");
-        return;
-      }
-      patch = {
-        ...patch,
-        completed: false,
-        completed_at: null,
-        completed_by: null,
-        approval_status: "approved",
-        task_status: "in_progress",
-        status: "open",
-      };
+      await refreshTasks();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Task action failed");
     }
+  }
 
+  async function deleteTask(id: string) {
+    if (!confirm("Delete this task?")) return;
     try {
-      const res = await fetch("/api/todos", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: task.id, ...patch }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "Failed to update task workflow");
-      toast("success", "Task updated");
-      await loadAll();
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Task workflow update failed");
+      const res = await fetch(`/api/todos?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Delete failed");
+      await refreshTasks();
+    } catch {
+      alert("Could not delete task");
     }
-  };
+  }
 
-  const submitDecline = async () => {
-    if (!declineTask || !currentUser?.username) return;
+  async function archiveTask(id: string) {
     try {
-      const patch = {
-        id: declineTask.id,
-        completed: false,
-        approval_status: "declined",
-        declined_by: currentUser.username,
-        declined_at: new Date().toISOString(),
-        decline_reason: declineReason.trim() || null,
-        task_status: "in_progress",
-        status: "declined",
-        updated_at: new Date().toISOString(),
-      };
-
-      const res = await fetch("/api/todos", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(patch),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "Decline failed");
-
-      toast("success", "Completion declined");
-      setDeclineModalOpen(false);
-      setDeclineTask(null);
-      setDeclineReason("");
-      await loadAll();
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Decline failed");
+      await updateTask(id, { archived: true });
+      await refreshTasks();
+    } catch {
+      alert("Could not archive task");
     }
-  };
+  }
 
-  const openShareModal = async (task: TodoRow) => {
-    if (!canEditTask(task)) {
-      toast("error", "Only task owner/editor can share this task");
-      return;
-    }
-    setShareTask(task);
-    setShareUsername("");
-    setShareCanEdit(false);
-    setShareModalOpen(true);
-  };
-
-  const shareTaskWithUser = async () => {
-    if (!shareTask || !shareUsername.trim() || !currentUser?.username) return;
+  async function shareCurrentTask() {
+    if (!shareTask || !shareTarget) return;
 
     try {
       const res = await fetch("/api/todos/shares", {
@@ -649,394 +722,634 @@ export default function TasksPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           todo_id: shareTask.id,
-          shared_by: currentUser.username,
-          shared_with: shareUsername.trim(),
-          can_edit: shareCanEdit,
+          shared_with: shareTarget,
+          shared_by: me,
+          can_edit: true,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "Share failed");
 
-      toast("success", `Task shared with ${shareUsername}`);
-      setShareUsername("");
-      await loadAll();
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Share failed");
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Share failed");
+      }
+
+      setShareTask(null);
+      setShareTarget("");
+      await refreshTasks();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Share failed");
     }
-  };
-
-  const removeShare = async (shareId: string) => {
-    try {
-      const res = await fetch(`/api/todos/shares?id=${encodeURIComponent(shareId)}`, { method: "DELETE" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "Failed to remove share");
-      toast("success", "Share removed");
-      await loadAll();
-    } catch (err) {
-      toast("error", err instanceof Error ? err.message : "Failed to remove share");
-    }
-  };
-
-  const shareOptions = useMemo(() => {
-    return users
-      .filter((u) => (u.username || "").toLowerCase() !== me)
-      .map((u) => ({ value: u.username, label: `${u.username} (${u.role})` }));
-  }, [users, me]);
-
-  if (loading) {
-    return (
-      <div className="space-y-6">
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-white font-heading">Tasks</h1>
-        <Card className="p-6"><TableSkeleton rows={8} cols={6} /></Card>
-      </div>
-    );
   }
 
-  const tabs: Array<{ key: TaskTab; label: string; count: number; show: boolean }> = [
-    { key: "my", label: "My Tasks", count: tabCounts.my, show: true },
-    { key: "assigned", label: "Assigned To Me", count: tabCounts.assigned, show: true },
-    { key: "team", label: "Team", count: tabCounts.team, show: isManager || isAdminOrSuper },
-    { key: "shared", label: "Shared", count: tabCounts.shared, show: true },
-    { key: "all", label: "All", count: tabCounts.all, show: isManager || isAdminOrSuper },
-  ];
+  async function runBulkAction(action: "complete" | "archive" | "delete") {
+    if (selectedIds.size === 0) {
+      alert("Select at least one task");
+      return;
+    }
+
+    try {
+      const ids = Array.from(selectedIds);
+
+      if (action === "complete") {
+        await Promise.all(
+          ids.map((id) =>
+            updateTask(id, {
+              completed: true,
+              completed_by: me,
+              approval_status: "approved",
+              task_status: "done",
+              status: "completed",
+            })
+          )
+        );
+      }
+
+      if (action === "archive") {
+        await Promise.all(ids.map((id) => updateTask(id, { archived: true })));
+      }
+
+      if (action === "delete") {
+        await Promise.all(
+          ids.map((id) => fetch(`/api/todos?id=${encodeURIComponent(id)}`, { method: "DELETE" }))
+        );
+      }
+
+      setSelectedIds(new Set());
+      await refreshTasks();
+    } catch {
+      alert("Bulk action failed");
+    }
+  }
+
+  function exportTasks(format: "csv" | "json") {
+    const rows = filteredTasks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      created_by: t.username,
+      assigned_to: t.assigned_to || "",
+      task_status: t.task_status || "",
+      approval_status: t.approval_status || "",
+      priority: t.priority || "",
+      due_date: t.due_date || "",
+      app_name: t.app_name || "",
+      package_name: t.package_name || "",
+      queue_department: t.queue_department || "",
+      created_at: t.created_at,
+    }));
+
+    let blob: Blob;
+    let filename: string;
+
+    if (format === "json") {
+      blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json" });
+      filename = `tasks-${Date.now()}.json`;
+    } else {
+      const header = Object.keys(rows[0] || { id: "", title: "" });
+      const csv = [header.join(",")]
+        .concat(
+          rows.map((r) =>
+            header
+              .map((k) => {
+                const value = String((r as Record<string, string>)[k] || "");
+                return `"${value.replace(/"/g, '""')}"`;
+              })
+              .join(",")
+          )
+        )
+        .join("\n");
+
+      blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      filename = `tasks-${Date.now()}.csv`;
+    }
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function toggleSelected(id: string) {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+  }
+
+  function selectAllVisible() {
+    setSelectedIds(new Set(filteredTasks.map((t) => t.id)));
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
+
+  if (loading) {
+    return <div className="p-6 text-sm text-gray-600">Loading task module...</div>;
+  }
 
   return (
-    <div className="space-y-6">
-      <div className="rounded-xl border border-gray-200 bg-gradient-to-r from-white to-cyan-50 p-5 dark:border-gray-700 dark:from-gray-900 dark:to-cyan-950/30">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900 dark:text-white font-heading">Tasks Module</h1>
-            <p className="text-sm text-gray-600 dark:text-gray-400">
-              Full workflow: assign, start, submit, approve/decline, share, and track task ownership.
-            </p>
-          </div>
-          <Button onClick={openCreate}>
-            <Plus className="h-4 w-4" /> New Task
-          </Button>
+    <div className="space-y-6 p-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-heading text-2xl font-bold text-gray-900 dark:text-white">Task Center</h1>
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            Legacy workflow parity: quick filters, smart lists, list/kanban/calendar, routing, sharing, and approvals.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" onClick={() => exportTasks("csv")}> <Download className="h-4 w-4" /> CSV </Button>
+          <Button variant="outline" onClick={() => exportTasks("json")}> <Download className="h-4 w-4" /> JSON </Button>
+          <Button onClick={openCreateModal}> <Plus className="h-4 w-4" /> New Task </Button>
         </div>
       </div>
 
-      <div className="flex gap-1 overflow-x-auto border-b border-gray-200 dark:border-gray-700">
-        {tabs.filter((t) => t.show).map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`flex items-center gap-2 whitespace-nowrap border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${
-              tab === t.key
-                ? "border-primary-500 text-primary-500"
-                : "border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700 dark:hover:text-gray-300"
-            }`}
-          >
-            {t.label}
-            <span className={`rounded-full px-2 py-0.5 text-xs ${
-              tab === t.key ? "bg-primary-100 text-primary-700 dark:bg-primary-900 dark:text-primary-300" : "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400"
-            }`}>
-              {t.count}
-            </span>
-          </button>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+        {kpis.map((k) => (
+          <Card key={k.title} className="border-gray-200 dark:border-gray-700">
+            <CardContent className="flex items-center justify-between py-4">
+              <div>
+                <p className="text-xs font-semibold uppercase text-gray-500">{k.title}</p>
+                <p className="text-2xl font-bold text-gray-900 dark:text-white">{k.value}</p>
+              </div>
+              <div className="rounded-full bg-primary-100 p-2 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300">
+                {k.icon}
+              </div>
+            </CardContent>
+          </Card>
         ))}
       </div>
 
-      <div className="flex flex-col gap-3 sm:flex-row">
-        <SearchBar value={search} onChange={setSearch} placeholder="Search task title, tags, category, user..." className="flex-1" />
-        <Select options={statusFilterOptions} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="w-48" />
-        <Select options={priorityFilterOptions} value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)} className="w-40" />
-      </div>
+      <Card>
+        <CardHeader className="flex flex-wrap items-center gap-3">
+          <div className="min-w-[220px] flex-1">
+            <Input
+              label="Search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Title, app, package, assignee..."
+            />
+          </div>
 
-      <div className="space-y-3">
-        {filteredTodos.map((task) => {
-          const unifiedStatus = getUnifiedStatus(task);
-          const overdue = isOverdue(task);
-          const owner = (task.username || "").toLowerCase() === me;
-          const assignee = (task.assigned_to || "").toLowerCase() === me;
-          const pendingApproval = task.approval_status === "pending_approval";
+          <div className="grid flex-[2] grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
+            <Select
+              label="Quick Filter"
+              value={quickFilter}
+              onChange={(e) => setQuickFilter(e.target.value as QuickFilter)}
+              options={[
+                { value: "my_pending", label: "My Pending" },
+                { value: "my_all", label: "My All" },
+                { value: "team_pending", label: "Team Pending" },
+                { value: "team_all", label: "Team All" },
+                { value: "all_pending", label: "All Pending" },
+                { value: "all", label: "All Tasks" },
+                { value: "approval_pending", label: "Approval Pending" },
+                { value: "approval_all", label: "Approval Queue" },
+              ]}
+            />
 
-          return (
-            <Card key={task.id} className="group transition-shadow hover:shadow-elevation-2">
-              <div className="p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <h3 className={`truncate text-sm font-semibold ${isDoneTask(task) ? "text-gray-400 line-through" : "text-gray-900 dark:text-white"}`}>
-                        {task.title}
-                      </h3>
-                      {overdue && <Badge variant="danger">Overdue</Badge>}
+            <Select
+              label="Status"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              options={[
+                { value: "all", label: "All Statuses" },
+                { value: "backlog", label: "Backlog" },
+                { value: "todo", label: "To Do" },
+                { value: "in_progress", label: "In Progress" },
+                { value: "done", label: "Done" },
+                { value: "pending_approval", label: "Pending Approval" },
+              ]}
+            />
+
+            <Select
+              label="Priority"
+              value={priorityFilter}
+              onChange={(e) => setPriorityFilter(e.target.value)}
+              options={[
+                { value: "all", label: "All Priorities" },
+                { value: "high", label: "High" },
+                { value: "medium", label: "Medium" },
+                { value: "low", label: "Low" },
+              ]}
+            />
+
+            <Select
+              label="Date"
+              value={dateFilter}
+              onChange={(e) => setDateFilter(e.target.value)}
+              options={[
+                { value: "all", label: "All Dates" },
+                { value: "today", label: "Due Today" },
+                { value: "overdue", label: "Overdue" },
+                { value: "next7", label: "Next 7 Days" },
+              ]}
+            />
+
+            <Select
+              label="Assignee"
+              value={assigneeFilter}
+              onChange={(e) => setAssigneeFilter(e.target.value)}
+              options={assigneeOptions}
+            />
+
+            <Select
+              label="Department"
+              value={departmentFilter}
+              onChange={(e) => setDepartmentFilter(e.target.value)}
+              options={departmentOptions}
+            />
+
+            <Select
+              label="Sort"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value)}
+              options={[
+                { value: "newest", label: "Newest" },
+                { value: "oldest", label: "Oldest" },
+                { value: "due_soon", label: "Due Soon" },
+                { value: "priority", label: "Priority" },
+              ]}
+            />
+
+            <div className="flex items-end gap-2">
+              <Button variant={viewMode === "list" ? "primary" : "outline"} size="sm" onClick={() => setViewMode("list")}>
+                <ListTodo className="h-4 w-4" />
+              </Button>
+              <Button variant={viewMode === "kanban" ? "primary" : "outline"} size="sm" onClick={() => setViewMode("kanban")}>
+                <Kanban className="h-4 w-4" />
+              </Button>
+              <Button variant={viewMode === "calendar" ? "primary" : "outline"} size="sm" onClick={() => setViewMode("calendar")}>
+                <CalendarDays className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-dashed border-gray-300 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/30">
+            <div className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
+              <Filter className="h-4 w-4" />
+              <span>{filteredTasks.length} filtered tasks</span>
+              <span>{selectedIds.size} selected</span>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" size="sm" onClick={selectAllVisible}>Select All</Button>
+              <Button variant="outline" size="sm" onClick={clearSelection}>Clear</Button>
+              <Button variant="success" size="sm" onClick={() => runBulkAction("complete")}>Complete</Button>
+              <Button variant="outline" size="sm" onClick={() => runBulkAction("archive")}>Archive</Button>
+              <Button variant="danger" size="sm" onClick={() => runBulkAction("delete")}>Delete</Button>
+            </div>
+          </div>
+
+          {viewMode === "list" && (
+            <div className="space-y-2">
+              {filteredTasks.map((task) => {
+                const mine = (task.assigned_to || "").toLowerCase() === lowerMe;
+                const canApprove = (task.username || "").toLowerCase() === lowerMe && task.approval_status === "pending_approval";
+                const isQueued = !!task.queue_department && task.queue_status === "queued";
+
+                return (
+                  <div
+                    key={task.id}
+                    className="grid grid-cols-1 gap-2 rounded border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800 lg:grid-cols-[28px_1fr_auto]"
+                  >
+                    <div className="pt-1">
+                      <input type="checkbox" checked={selectedIds.has(task.id)} onChange={() => toggleSelected(task.id)} />
                     </div>
-                    {task.description && <p className="mt-1 line-clamp-2 text-xs text-gray-500">{task.description}</p>}
 
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <Badge variant={statusBadgeVariant(unifiedStatus)}>{unifiedStatus}</Badge>
-                      <Badge variant={priorityBadgeVariant(task.priority)}>{task.priority || "low"}</Badge>
-                      {task.due_date && (
-                        <span className={`flex items-center gap-1 text-xs ${overdue ? "font-semibold text-red-500" : "text-gray-500"}`}>
-                          <Calendar className="h-3 w-3" />
-                          {formatDate(task.due_date)}
-                        </span>
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="font-semibold text-gray-900 dark:text-white">{task.title}</h3>
+                        <Badge variant="outline">{task.task_status || "todo"}</Badge>
+                        <Badge variant={task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
+                          {task.priority || "medium"}
+                        </Badge>
+                        {task.approval_status === "pending_approval" && <Badge variant="warning">Approval Pending</Badge>}
+                        {task.queue_department && <Badge variant="info">Queue: {task.queue_department}</Badge>}
+                      </div>
+
+                      <div className="text-xs text-gray-600 dark:text-gray-300">
+                        <span>By {task.username}</span>
+                        <span className="mx-2">•</span>
+                        <span>Assigned: {task.assigned_to || "Unassigned"}</span>
+                        <span className="mx-2">•</span>
+                        <span>Due: {task.due_date ? formatDate(task.due_date) : "--"}</span>
+                        {task.app_name && (
+                          <>
+                            <span className="mx-2">•</span>
+                            <span>App: {task.app_name}</span>
+                          </>
+                        )}
+                        {task.package_name && (
+                          <>
+                            <span className="mx-2">•</span>
+                            <span>Package: {task.package_name}</span>
+                          </>
+                        )}
+                      </div>
+
+                      {task.description && <p className="text-sm text-gray-700 dark:text-gray-200">{task.description}</p>}
+                    </div>
+
+                    <div className="flex flex-wrap items-start justify-end gap-1">
+                      {isQueued && (
+                        <Button size="sm" variant="secondary" onClick={() => runTaskAction(task, "claim_queue")}>
+                          Pick Queue
+                        </Button>
                       )}
-                      <span className="flex items-center gap-1 text-xs text-gray-500">
-                        <UserCheck className="h-3 w-3" />
-                        {task.assigned_to || "Unassigned"}
-                      </span>
-                      <span className="text-xs text-gray-400">{timeAgo(task.updated_at || task.created_at)}</span>
-                    </div>
-                  </div>
 
-                  <div className="flex shrink-0 items-center gap-1 opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
-                    {assignee && !isDoneTask(task) && unifiedStatus !== "in_progress" && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => updateTaskWorkflow(task, "start")} title="Start">
-                        <Play className="h-4 w-4" />
-                      </Button>
-                    )}
-                    {(assignee || owner || isAdminOrSuper) && !isDoneTask(task) && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => updateTaskWorkflow(task, "submit")} title="Submit Completion">
-                        <ClipboardCheck className="h-4 w-4" />
-                      </Button>
-                    )}
-                    {(owner || isAdminOrSuper) && pendingApproval && (
-                      <>
-                        <Button variant="ghost" size="icon-sm" onClick={() => updateTaskWorkflow(task, "approve")} title="Approve">
-                          <ShieldCheck className="h-4 w-4" />
+                      {(mine || isAdminLike(currentUser)) && task.task_status !== "in_progress" && !isDone(task) && (
+                        <Button size="sm" variant="outline" onClick={() => runTaskAction(task, "start")}>
+                          Start
                         </Button>
-                        <Button variant="ghost" size="icon-sm" onClick={() => updateTaskWorkflow(task, "decline")} title="Decline">
-                          <XCircle className="h-4 w-4" />
+                      )}
+
+                      {(mine || isAdminLike(currentUser)) && !isDone(task) && (
+                        <Button size="sm" variant="success" onClick={() => runTaskAction(task, "submit")}>
+                          Submit
                         </Button>
-                      </>
-                    )}
-                    {(owner || isAdminOrSuper) && isDoneTask(task) && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => updateTaskWorkflow(task, "reopen")} title="Reopen">
-                        <Clock3 className="h-4 w-4" />
+                      )}
+
+                      {canApprove && (
+                        <>
+                          <Button size="sm" variant="success" onClick={() => runTaskAction(task, "approve")}>
+                            Approve
+                          </Button>
+                          <Button size="sm" variant="danger" onClick={() => runTaskAction(task, "decline")}>
+                            Decline
+                          </Button>
+                        </>
+                      )}
+
+                      {isDone(task) && (
+                        <Button size="sm" variant="outline" onClick={() => runTaskAction(task, "reopen")}>
+                          Reopen
+                        </Button>
+                      )}
+
+                      <Button size="sm" variant="outline" onClick={() => setDetailTask(task)}>
+                        <Eye className="h-4 w-4" />
                       </Button>
-                    )}
-                    {canEditTask(task) && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => openEdit(task)} title="Edit">
-                        <Users className="h-4 w-4" />
+                      <Button size="sm" variant="outline" onClick={() => openEditModal(task)}>
+                        <Pencil className="h-4 w-4" />
                       </Button>
-                    )}
-                    {canEditTask(task) && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => openShareModal(task)} title="Share">
+                      <Button size="sm" variant="outline" onClick={() => setShareTask(task)}>
                         <Share2 className="h-4 w-4" />
                       </Button>
-                    )}
-                    {canDeleteTask(task) && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => setDeleteTask(task)} className="text-red-500" title="Delete">
+                      <Button size="sm" variant="outline" onClick={() => archiveTask(task.id)}>
+                        <Columns3 className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant="danger" onClick={() => deleteTask(task.id)}>
                         <Trash2 className="h-4 w-4" />
                       </Button>
-                    )}
+                    </div>
                   </div>
+                );
+              })}
+
+              {filteredTasks.length === 0 && (
+                <div className="rounded border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500 dark:border-gray-700">
+                  No tasks match current filters.
                 </div>
+              )}
+            </div>
+          )}
 
-                <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-gray-100 pt-3 text-xs text-gray-500 dark:border-gray-800">
-                  <span>Owner: <strong>{task.username}</strong></span>
-                  <span>Created: {formatDateTime(task.created_at)}</span>
-                  {task.completed_by && <span>Completed by: <strong>{task.completed_by}</strong></span>}
-                  {task.approved_by && <span>Approved by: <strong>{task.approved_by}</strong></span>}
-                  {task.declined_by && <span>Declined by: <strong>{task.declined_by}</strong></span>}
+          {viewMode === "kanban" && (
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              {[
+                { key: "backlog", label: "Backlog" },
+                { key: "todo", label: "To Do" },
+                { key: "in_progress", label: "In Progress" },
+                { key: "done", label: "Done" },
+              ].map((col) => {
+                const colTasks = filteredTasks.filter((t) => (t.task_status || "todo") === col.key);
+                return (
+                  <div key={col.key} className="rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-900/30">
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-sm font-semibold text-gray-700 dark:text-gray-200">{col.label}</p>
+                      <Badge variant="outline">{colTasks.length}</Badge>
+                    </div>
+
+                    <div className="space-y-2">
+                      {colTasks.map((task) => (
+                        <button
+                          key={task.id}
+                          type="button"
+                          onClick={() => setDetailTask(task)}
+                          className="w-full rounded border border-gray-200 bg-white p-2 text-left hover:border-primary-400 dark:border-gray-700 dark:bg-gray-800"
+                        >
+                          <p className="line-clamp-2 text-sm font-semibold text-gray-900 dark:text-white">{task.title}</p>
+                          <p className="mt-1 text-xs text-gray-500">{task.assigned_to || "Unassigned"}</p>
+                          <div className="mt-2 flex items-center justify-between">
+                            <Badge variant={task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
+                              {task.priority || "medium"}
+                            </Badge>
+                            <span className="text-xs text-gray-500">{task.due_date ? formatDate(task.due_date) : "No due"}</span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {viewMode === "calendar" && (
+            <div className="space-y-2">
+              {filteredTasks
+                .filter((t) => !!t.due_date)
+                .sort((a, b) => new Date(a.due_date || "").getTime() - new Date(b.due_date || "").getTime())
+                .map((task) => (
+                  <div key={task.id} className="flex items-center justify-between rounded border border-gray-200 px-3 py-2 dark:border-gray-700">
+                    <div>
+                      <p className="font-semibold text-gray-900 dark:text-white">{task.title}</p>
+                      <p className="text-xs text-gray-500">{task.assigned_to || "Unassigned"} • {task.task_status || "todo"}</p>
+                    </div>
+                    <Badge variant="outline">{task.due_date ? formatDate(task.due_date) : "-"}</Badge>
+                  </div>
+                ))}
+
+              {filteredTasks.filter((t) => !!t.due_date).length === 0 && (
+                <div className="rounded border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500 dark:border-gray-700">
+                  Calendar view has no due dates for current filters.
                 </div>
-              </div>
-            </Card>
-          );
-        })}
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
-        {filteredTodos.length === 0 && (
-          <div className="py-12 text-center">
-            <CheckCircle2 className="mx-auto h-12 w-12 text-gray-300 dark:text-gray-600" />
-            <p className="mt-3 text-sm text-gray-500">No tasks found in this view</p>
-            <Button className="mt-4" onClick={openCreate}>
-              <Plus className="h-4 w-4" /> Create Task
-            </Button>
-          </div>
-        )}
-      </div>
-
-      <Modal open={formOpen} onClose={() => setFormOpen(false)} title={editTaskId ? "Edit Task" : "New Task"} size="lg">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="sm:col-span-2">
-            <Input
-              label="Title"
-              value={formData.title}
-              onChange={(e) => setFormData((prev) => ({ ...prev, title: e.target.value }))}
-              placeholder="Task title"
-              autoFocus
-            />
-          </div>
-          <div className="sm:col-span-2">
-            <label className="mb-1.5 block text-xs font-semibold text-gray-700 dark:text-gray-300">Description</label>
-            <textarea
-              rows={3}
-              value={formData.description}
-              onChange={(e) => setFormData((prev) => ({ ...prev, description: e.target.value }))}
-              className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500/20 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-            />
-          </div>
-
+      <Modal
+        open={taskModalOpen}
+        onClose={() => {
+          setTaskModalOpen(false);
+          if (!editingTask) resetForm();
+        }}
+        title={editingTask ? "Edit Task" : "Create Task"}
+        size="xl"
+      >
+        <div className="grid gap-3 md:grid-cols-2">
+          <Input label="Task Subject" value={form.title} onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))} />
           <Select
             label="Priority"
-            options={priorityFilterOptions.filter((p) => p.value)}
-            value={formData.priority}
-            onChange={(e) => setFormData((prev) => ({ ...prev, priority: e.target.value as TodoPriority }))}
-          />
-          <Select
-            label="Assign To"
-            options={[{ value: "", label: "Unassigned" }, ...users.map((u) => ({ value: u.username, label: `${u.username} (${u.role})` }))]}
-            value={formData.assigned_to}
-            onChange={(e) => setFormData((prev) => ({ ...prev, assigned_to: e.target.value }))}
+            value={form.priority}
+            onChange={(e) => setForm((p) => ({ ...p, priority: e.target.value as TaskForm["priority"] }))}
+            options={[
+              { value: "high", label: "High" },
+              { value: "medium", label: "Medium" },
+              { value: "low", label: "Low" },
+            ]}
           />
 
-          <Input
-            label="Due Date"
-            type="date"
-            value={formData.due_date}
-            onChange={(e) => setFormData((prev) => ({ ...prev, due_date: e.target.value }))}
-          />
-          <Input
-            label="Expected Due Date"
-            type="date"
-            value={formData.expected_due_date}
-            onChange={(e) => setFormData((prev) => ({ ...prev, expected_due_date: e.target.value }))}
-          />
-
-          <Input
-            label="Category"
-            value={formData.category}
-            onChange={(e) => setFormData((prev) => ({ ...prev, category: e.target.value }))}
-            placeholder="Marketing / Design / QA"
-          />
-          <Input
-            label="KPI Type"
-            value={formData.kpi_type}
-            onChange={(e) => setFormData((prev) => ({ ...prev, kpi_type: e.target.value }))}
-            placeholder="Performance KPI"
-          />
-
-          <div className="sm:col-span-2">
-            <Input
-              label="Tags"
-              value={formData.tags}
-              onChange={(e) => setFormData((prev) => ({ ...prev, tags: e.target.value }))}
-              placeholder="Comma separated tags"
-            />
+          <div className="md:col-span-2">
+            <Input label="Description" value={form.description} onChange={(e) => setForm((p) => ({ ...p, description: e.target.value }))} />
           </div>
 
-          <div className="sm:col-span-2">
-            <Input
-              label="Queue Department"
-              value={formData.queue_department}
-              onChange={(e) => setFormData((prev) => ({ ...prev, queue_department: e.target.value }))}
-              placeholder="Department queue (optional)"
-            />
+          <div className="md:col-span-2">
+            <Input label="Our Goal" value={form.our_goal} onChange={(e) => setForm((p) => ({ ...p, our_goal: e.target.value }))} />
           </div>
 
-          <div className="sm:col-span-2">
-            <label className="mb-1.5 block text-xs font-semibold text-gray-700 dark:text-gray-300">Our Goal</label>
-            <textarea
-              rows={3}
-              value={formData.our_goal}
-              onChange={(e) => setFormData((prev) => ({ ...prev, our_goal: e.target.value }))}
-              className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500/20 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-            />
-          </div>
+          <Input label="Due Date" type="datetime-local" value={form.due_date} onChange={(e) => setForm((p) => ({ ...p, due_date: e.target.value }))} />
+          <Input label="KPI" value={form.kpi_type} onChange={(e) => setForm((p) => ({ ...p, kpi_type: e.target.value }))} />
 
-          <div className="sm:col-span-2">
-            <label className="mb-1.5 block text-xs font-semibold text-gray-700 dark:text-gray-300">Notes</label>
-            <textarea
-              rows={3}
-              value={formData.notes}
-              onChange={(e) => setFormData((prev) => ({ ...prev, notes: e.target.value }))}
-              className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500/20 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-            />
+          <Input label="App Name" value={form.app_name} onChange={(e) => setForm((p) => ({ ...p, app_name: e.target.value }))} />
+          <Input label="Package" value={form.package_name} onChange={(e) => setForm((p) => ({ ...p, package_name: e.target.value }))} />
+
+          <div className="md:col-span-2">
+            <Input label="Notes" value={form.notes} onChange={(e) => setForm((p) => ({ ...p, notes: e.target.value }))} />
           </div>
         </div>
-        <div className="mt-6 flex justify-end gap-3">
-          <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
-          <Button onClick={saveTask} loading={saving}>{editTaskId ? "Save Changes" : "Create Task"}</Button>
+
+        <div className="mt-4 rounded border border-gray-200 p-3 dark:border-gray-700">
+          <p className="mb-2 text-sm font-semibold text-gray-800 dark:text-gray-200">Routing</p>
+
+          <div className="grid gap-3 md:grid-cols-3">
+            {[
+              { key: "self", label: "Self/User" },
+              { key: "department", label: "Department Queue" },
+              { key: "manager", label: "Manager" },
+            ].map((opt) => (
+              <button
+                key={opt.key}
+                type="button"
+                onClick={() => setForm((p) => ({ ...p, route_mode: opt.key as TaskForm["route_mode"] }))}
+                className={`rounded border p-3 text-left text-sm ${
+                  form.route_mode === opt.key
+                    ? "border-primary-500 bg-primary-50 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300"
+                    : "border-gray-300 text-gray-700 dark:border-gray-600 dark:text-gray-300"
+                }`}
+              >
+                <p className="font-semibold">{opt.label}</p>
+              </button>
+            ))}
+          </div>
+
+          {form.route_mode === "self" && (
+            <div className="mt-3">
+              <Select
+                label="Assign To"
+                value={form.assigned_to}
+                onChange={(e) => setForm((p) => ({ ...p, assigned_to: e.target.value }))}
+                options={[
+                  { value: "", label: "Me (default)" },
+                  ...users.map((u) => ({ value: u.username, label: u.username })),
+                ]}
+              />
+            </div>
+          )}
+
+          {form.route_mode === "manager" && (
+            <div className="mt-3">
+              <Select
+                label="Manager"
+                value={form.assigned_to}
+                onChange={(e) => setForm((p) => ({ ...p, assigned_to: e.target.value }))}
+                options={[{ value: "", label: "Select manager" }, ...managerOptions]}
+              />
+            </div>
+          )}
+
+          {form.route_mode === "department" && (
+            <div className="mt-3">
+              <Input
+                label="Queue Department"
+                value={form.queue_department}
+                onChange={(e) => setForm((p) => ({ ...p, queue_department: e.target.value }))}
+                placeholder="e.g. SEO, PPC, Design"
+              />
+            </div>
+          )}
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="outline" onClick={resetForm}>Clear Draft</Button>
+          <Button variant="outline" onClick={() => setTaskModalOpen(false)}>Cancel</Button>
+          <Button loading={saving} onClick={submitTask}>{editingTask ? "Update Task" : "Create Task"}</Button>
         </div>
       </Modal>
 
       <Modal open={!!detailTask} onClose={() => setDetailTask(null)} title="Task Details" size="lg">
         {detailTask && (
-          <div className="space-y-4">
+          <div className="space-y-3">
             <div>
-              <h3 className="text-lg font-bold text-gray-900 dark:text-white">{detailTask.title}</h3>
-              <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">{detailTask.description || "No description"}</p>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">{detailTask.title}</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-300">{detailTask.description || "No description"}</p>
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div><span className="text-xs font-semibold text-gray-500">Status</span><div className="mt-1"><Badge variant={statusBadgeVariant(getUnifiedStatus(detailTask))}>{getUnifiedStatus(detailTask)}</Badge></div></div>
-              <div><span className="text-xs font-semibold text-gray-500">Priority</span><div className="mt-1"><Badge variant={priorityBadgeVariant(detailTask.priority)}>{detailTask.priority}</Badge></div></div>
-              <div><span className="text-xs font-semibold text-gray-500">Created By</span><p className="mt-1 text-sm">{detailTask.username}</p></div>
-              <div><span className="text-xs font-semibold text-gray-500">Assigned To</span><p className="mt-1 text-sm">{detailTask.assigned_to || "Unassigned"}</p></div>
-              <div><span className="text-xs font-semibold text-gray-500">Due Date</span><p className="mt-1 text-sm">{detailTask.due_date ? formatDate(detailTask.due_date) : "No due date"}</p></div>
-              <div><span className="text-xs font-semibold text-gray-500">Created</span><p className="mt-1 text-sm">{formatDateTime(detailTask.created_at)}</p></div>
+
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <p><strong>Created By:</strong> {detailTask.username}</p>
+              <p><strong>Assigned To:</strong> {detailTask.assigned_to || "Unassigned"}</p>
+              <p><strong>Task Status:</strong> {detailTask.task_status || "todo"}</p>
+              <p><strong>Approval:</strong> {detailTask.approval_status || "approved"}</p>
+              <p><strong>Priority:</strong> {detailTask.priority || "medium"}</p>
+              <p><strong>Due:</strong> {detailTask.due_date ? formatDate(detailTask.due_date) : "--"}</p>
+              <p><strong>App:</strong> {detailTask.app_name || "--"}</p>
+              <p><strong>Package:</strong> {detailTask.package_name || "--"}</p>
+              <p><strong>Queue:</strong> {detailTask.queue_department || "--"}</p>
+              <p><strong>Queue Status:</strong> {detailTask.queue_status || "--"}</p>
             </div>
-            {detailTask.our_goal && <div><span className="text-xs font-semibold text-gray-500">Our Goal</span><p className="mt-1 text-sm">{detailTask.our_goal}</p></div>}
-            {detailTask.notes && <div><span className="text-xs font-semibold text-gray-500">Notes</span><p className="mt-1 text-sm">{detailTask.notes}</p></div>}
+
+            {detailTask.our_goal && (
+              <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+                <p className="font-semibold">Our Goal</p>
+                <p>{detailTask.our_goal}</p>
+              </div>
+            )}
+
+            {detailTask.notes && (
+              <div className="rounded border border-gray-200 p-2 text-sm dark:border-gray-700">
+                <p className="font-semibold">Notes</p>
+                <p>{detailTask.notes}</p>
+              </div>
+            )}
           </div>
         )}
       </Modal>
 
-      <Modal open={shareModalOpen} onClose={() => setShareModalOpen(false)} title={`Share Task: ${shareTask?.title || ""}`}>
-        <div className="space-y-4">
-          <div className="flex gap-2">
-            <Select
-              options={[{ value: "", label: "Select user..." }, ...shareOptions]}
-              value={shareUsername}
-              onChange={(e) => setShareUsername(e.target.value)}
-              className="flex-1"
-            />
-            <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-              <input type="checkbox" checked={shareCanEdit} onChange={(e) => setShareCanEdit(e.target.checked)} className="rounded border-gray-300" />
-              Can Edit
-            </label>
-            <Button onClick={shareTaskWithUser} disabled={!shareUsername}>Share</Button>
-          </div>
-
-          {shareTask && (
-            <div>
-              <h4 className="mb-2 text-sm font-semibold text-gray-700 dark:text-gray-300">Current Shares</h4>
-              <div className="space-y-2">
-                {(shareMapByTodo.get(shareTask.id) || []).map((s) => (
-                  <div key={s.id} className="flex items-center justify-between rounded bg-gray-50 px-3 py-2 dark:bg-gray-800">
-                    <div className="flex items-center gap-2">
-                      <Avatar name={s.shared_with} size="sm" />
-                      <span className="text-sm">{s.shared_with}</span>
-                      {s.can_edit && <Badge variant="info">Can Edit</Badge>}
-                    </div>
-                    <Button variant="ghost" size="icon-sm" onClick={() => removeShare(s.id)} className="text-red-500">
-                      <Trash2 className="h-3 w-3" />
-                    </Button>
-                  </div>
-                ))}
-                {(shareMapByTodo.get(shareTask.id) || []).length === 0 && (
-                  <p className="text-sm text-gray-500">No shares yet</p>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      </Modal>
-
-      <Modal open={!!deleteTask} onClose={() => setDeleteTask(null)} title="Delete Task" size="sm">
-        <p className="text-sm text-gray-600 dark:text-gray-400">
-          Delete <strong>{deleteTask?.title}</strong>? This cannot be undone.
-        </p>
-        <div className="mt-6 flex justify-end gap-3">
-          <Button variant="outline" onClick={() => setDeleteTask(null)}>Cancel</Button>
-          <Button variant="danger" onClick={removeTask}>Delete</Button>
-        </div>
-      </Modal>
-
-      <Modal open={declineModalOpen} onClose={() => setDeclineModalOpen(false)} title="Decline Completion" size="sm">
-        <div>
-          <label className="mb-1.5 block text-xs font-semibold text-gray-700 dark:text-gray-300">Reason (optional)</label>
-          <textarea
-            rows={4}
-            value={declineReason}
-            onChange={(e) => setDeclineReason(e.target.value)}
-            className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500/20 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+      <Modal open={!!shareTask} onClose={() => setShareTask(null)} title="Share Task" size="sm">
+        <div className="space-y-3">
+          <Select
+            label="Share With"
+            value={shareTarget}
+            onChange={(e) => setShareTarget(e.target.value)}
+            options={[
+              { value: "", label: "Select user" },
+              ...users
+                .filter((u) => u.username !== me)
+                .map((u) => ({ value: u.username, label: `${u.username} (${u.role})` })),
+            ]}
           />
-        </div>
-        <div className="mt-6 flex justify-end gap-3">
-          <Button variant="outline" onClick={() => setDeclineModalOpen(false)}>Cancel</Button>
-          <Button variant="danger" onClick={submitDecline}>Decline</Button>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setShareTask(null)}>Cancel</Button>
+            <Button onClick={shareCurrentTask}>Share</Button>
+          </div>
         </div>
       </Modal>
     </div>
