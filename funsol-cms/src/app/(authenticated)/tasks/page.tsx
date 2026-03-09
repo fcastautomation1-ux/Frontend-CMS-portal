@@ -52,7 +52,7 @@ type Todo = {
   task_status: "backlog" | "todo" | "in_progress" | "done" | null;
   approval_status: "approved" | "pending_approval" | "declined" | null;
   status: "open" | "in-progress" | "pending" | "approved" | "declined" | "completed" | null;
-  priority: "high" | "medium" | "low" | null;
+  priority: "urgent" | "high" | "medium" | "low" | null;
   due_date: string | null;
   completed: boolean | null;
   completed_by: string | null;
@@ -97,19 +97,32 @@ type QuickFilter =
   | "all_pending"
   | "all"
   | "approval_pending"
-  | "approval_all";
+  | "approval_all"
+  | "my_approval_pending"
+  | "other_approval_pending";
 
 type ViewMode = "list" | "kanban" | "calendar";
 type ModulePanel = "workboard" | "queue" | "approval";
 
-type SmartList = "none" | "overdue" | "due_today" | "unassigned" | "queued" | "created_by_me";
+type SmartList =
+  | "all"
+  | "today"
+  | "upcoming"
+  | "overdue"
+  | "thisweek"
+  | "thismonth"
+  | "my_approval_pending"
+  | "other_approval_pending"
+  | "unassigned"
+  | "queued"
+  | "created_by_me";
 
 type TaskForm = {
   title: string;
   description: string;
   our_goal: string;
   notes: string;
-  priority: "high" | "medium" | "low";
+  priority: "urgent" | "high" | "medium" | "low";
   due_date: string;
   app_name: string;
   package_name: string;
@@ -202,12 +215,15 @@ export default function TasksPage() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [priorityFilter, setPriorityFilter] = useState("all");
   const [dateFilter, setDateFilter] = useState("all");
+  const [messageFilter, setMessageFilter] = useState("all");
+  const [customDateFrom, setCustomDateFrom] = useState("");
+  const [customDateTo, setCustomDateTo] = useState("");
   const [assigneeFilter, setAssigneeFilter] = useState("all");
   const [departmentFilter, setDepartmentFilter] = useState("all");
   const [sortBy, setSortBy] = useState("newest");
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [panel, setPanel] = useState<ModulePanel>("workboard");
-  const [smartList, setSmartList] = useState<SmartList>("none");
+  const [smartList, setSmartList] = useState<SmartList>("all");
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
@@ -380,13 +396,18 @@ export default function TasksPage() {
       if (quickFilter === "all_pending" && isDone(task)) return false;
       if (quickFilter === "approval_pending" && !pendingApproval) return false;
       if (quickFilter === "approval_all" && !(task.approval_status || "").includes("approval")) return false;
+      if (quickFilter === "my_approval_pending" && !((task.username || "").toLowerCase() === lowerMe && pendingApproval)) return false;
+      if (quickFilter === "other_approval_pending" && !((task.username || "").toLowerCase() !== lowerMe && pendingApproval)) return false;
 
       if (statusFilter !== "all") {
-        if (statusFilter === "pending_approval") {
-          if (!pendingApproval) return false;
-        } else if ((task.task_status || "") !== statusFilter) {
-          return false;
+        if (statusFilter === "pending" && isDone(task)) return false;
+        if (statusFilter === "queue" && !(task.queue_status === "queued" || !!task.queue_department)) return false;
+        if (statusFilter === "inprogress" && !((task.task_status || "") === "in_progress" || (task.status || "") === "in-progress")) return false;
+        if (statusFilter === "completed" && !isDone(task)) return false;
+        if (statusFilter === "overdue") {
+          if (!task.due_date || !(new Date(task.due_date) < todayStart && !isDone(task))) return false;
         }
+        if (statusFilter === "archived" && !task.archived) return false;
       }
 
       if (priorityFilter !== "all" && task.priority !== priorityFilter) return false;
@@ -409,12 +430,64 @@ export default function TasksPage() {
         if (!due || Number.isNaN(due.getTime())) return false;
 
         if (dateFilter === "today" && (due < todayStart || due > todayEnd)) return false;
+        if (dateFilter === "yesterday") {
+          const y = new Date(now);
+          y.setDate(now.getDate() - 1);
+          if (due < startOfDay(y) || due > endOfDay(y)) return false;
+        }
+        if (dateFilter === "last7days") {
+          const last7 = new Date(now);
+          last7.setDate(now.getDate() - 7);
+          if (!(due >= startOfDay(last7) && due <= todayEnd)) return false;
+        }
+        if (dateFilter === "last30days") {
+          const last30 = new Date(now);
+          last30.setDate(now.getDate() - 30);
+          if (!(due >= startOfDay(last30) && due <= todayEnd)) return false;
+        }
+        if (dateFilter === "thisweek") {
+          const weekStart = new Date(now);
+          weekStart.setDate(now.getDate() - now.getDay());
+          if (!(due >= startOfDay(weekStart) && due <= endOfDay(new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 6)))) return false;
+        }
+        if (dateFilter === "lastweek") {
+          const weekStart = new Date(now);
+          weekStart.setDate(now.getDate() - now.getDay() - 7);
+          const weekEnd = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 6);
+          if (!(due >= startOfDay(weekStart) && due <= endOfDay(weekEnd))) return false;
+        }
+        if (dateFilter === "thismonth") {
+          if (due.getMonth() !== now.getMonth() || due.getFullYear() !== now.getFullYear()) return false;
+        }
+        if (dateFilter === "lastmonth") {
+          const lm = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+          if (due.getMonth() !== lm.getMonth() || due.getFullYear() !== lm.getFullYear()) return false;
+        }
+        if (dateFilter === "thisyear") {
+          if (due.getFullYear() !== now.getFullYear()) return false;
+        }
         if (dateFilter === "overdue" && !(due < todayStart && !isDone(task))) return false;
         if (dateFilter === "next7") {
           const next7 = new Date(now);
           next7.setDate(now.getDate() + 7);
           if (!(due >= todayStart && due <= endOfDay(next7))) return false;
         }
+        if (dateFilter === "custom") {
+          if (!customDateFrom || !customDateTo) return false;
+          const from = startOfDay(new Date(customDateFrom));
+          const to = endOfDay(new Date(customDateTo));
+          if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return false;
+          if (!(due >= from && due <= to)) return false;
+        }
+      }
+
+      if (messageFilter === "unread") {
+        const notes = (task.notes || "").toLowerCase();
+        if (!notes.includes("[unread]") && !notes.includes("unread")) return false;
+      }
+      if (messageFilter === "read") {
+        const notes = (task.notes || "").toLowerCase();
+        if (!notes || notes.includes("[unread]")) return false;
       }
 
       if (search.trim()) {
@@ -435,14 +508,40 @@ export default function TasksPage() {
         if (!text.includes(q)) return false;
       }
 
-      if (smartList !== "none") {
+      if (smartList !== "all") {
         if (smartList === "overdue") {
           if (!task.due_date || !(new Date(task.due_date) < todayStart && !isDone(task))) return false;
         }
-        if (smartList === "due_today") {
+        if (smartList === "today") {
           if (!task.due_date) return false;
           const due = new Date(task.due_date);
           if (due < todayStart || due > todayEnd) return false;
+        }
+        if (smartList === "upcoming") {
+          if (!task.due_date) return false;
+          const due = new Date(task.due_date);
+          const next7 = new Date(now);
+          next7.setDate(now.getDate() + 7);
+          if (!(due >= todayStart && due <= endOfDay(next7))) return false;
+        }
+        if (smartList === "thisweek") {
+          if (!task.due_date) return false;
+          const due = new Date(task.due_date);
+          const weekStart = new Date(now);
+          weekStart.setDate(now.getDate() - now.getDay());
+          const weekEnd = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 6);
+          if (!(due >= startOfDay(weekStart) && due <= endOfDay(weekEnd))) return false;
+        }
+        if (smartList === "thismonth") {
+          if (!task.due_date) return false;
+          const due = new Date(task.due_date);
+          if (due.getMonth() !== now.getMonth() || due.getFullYear() !== now.getFullYear()) return false;
+        }
+        if (smartList === "my_approval_pending") {
+          if (!((task.username || "").toLowerCase() === lowerMe && isPending(task))) return false;
+        }
+        if (smartList === "other_approval_pending") {
+          if (!((task.username || "").toLowerCase() !== lowerMe && isPending(task))) return false;
         }
         if (smartList === "unassigned" && !!task.assigned_to) return false;
         if (smartList === "queued" && !(task.queue_status === "queued" || !!task.queue_department)) return false;
@@ -462,16 +561,16 @@ export default function TasksPage() {
         return da - db;
       }
       if (sortBy === "priority") {
-        const rank = { high: 0, medium: 1, low: 2 } as const;
-        const pa = rank[(a.priority || "medium") as keyof typeof rank] ?? 1;
-        const pb = rank[(b.priority || "medium") as keyof typeof rank] ?? 1;
+        const rank = { urgent: 0, high: 1, medium: 2, low: 3 } as const;
+        const pa = rank[(a.priority || "medium") as keyof typeof rank] ?? 2;
+        const pb = rank[(b.priority || "medium") as keyof typeof rank] ?? 2;
         return pa - pb;
       }
       return 0;
     });
 
     return sorted;
-  }, [visibleTasks, quickFilter, statusFilter, priorityFilter, dateFilter, assigneeFilter, departmentFilter, search, smartList, sortBy, lowerMe, managerTeam]);
+  }, [visibleTasks, quickFilter, statusFilter, priorityFilter, dateFilter, assigneeFilter, departmentFilter, search, smartList, sortBy, lowerMe, managerTeam, customDateFrom, customDateTo, messageFilter]);
 
   const quickFilterCounts = useMemo(() => {
     const mine = visibleTasks.filter((task) => {
@@ -494,6 +593,8 @@ export default function TasksPage() {
       all: visibleTasks.length,
       approval_pending: visibleTasks.filter((t) => isPending(t)).length,
       approval_all: visibleTasks.filter((t) => (t.approval_status || "") !== "approved").length,
+      my_approval_pending: visibleTasks.filter((t) => (t.username || "").toLowerCase() === lowerMe && isPending(t)).length,
+      other_approval_pending: visibleTasks.filter((t) => (t.username || "").toLowerCase() !== lowerMe && isPending(t)).length,
     };
   }, [visibleTasks, lowerMe, managerTeam]);
 
@@ -1166,6 +1267,8 @@ export default function TasksPage() {
                 { value: "all", label: "All Tasks" },
                 { value: "approval_pending", label: "Approval Pending" },
                 { value: "approval_all", label: "Approval Queue" },
+                { value: "my_approval_pending", label: "Need My Approval" },
+                { value: "other_approval_pending", label: "Others Approval" },
               ]}
             />
 
@@ -1175,11 +1278,12 @@ export default function TasksPage() {
               onChange={(e) => setStatusFilter(e.target.value)}
               options={[
                 { value: "all", label: "All Statuses" },
-                { value: "backlog", label: "Backlog" },
-                { value: "todo", label: "To Do" },
-                { value: "in_progress", label: "In Progress" },
-                { value: "done", label: "Done" },
-                { value: "pending_approval", label: "Pending Approval" },
+                { value: "pending", label: "Pending" },
+                { value: "queue", label: "Queue" },
+                { value: "inprogress", label: "In Progress" },
+                { value: "completed", label: "Completed" },
+                { value: "overdue", label: "Overdue" },
+                { value: "archived", label: "Archived" },
               ]}
             />
 
@@ -1189,6 +1293,7 @@ export default function TasksPage() {
               onChange={(e) => setPriorityFilter(e.target.value)}
               options={[
                 { value: "all", label: "All Priorities" },
+                { value: "urgent", label: "Urgent" },
                 { value: "high", label: "High" },
                 { value: "medium", label: "Medium" },
                 { value: "low", label: "Low" },
@@ -1201,9 +1306,28 @@ export default function TasksPage() {
               onChange={(e) => setDateFilter(e.target.value)}
               options={[
                 { value: "all", label: "All Dates" },
-                { value: "today", label: "Due Today" },
+                { value: "today", label: "Today" },
+                { value: "yesterday", label: "Yesterday" },
+                { value: "last7days", label: "Last 7 Days" },
+                { value: "last30days", label: "Last 30 Days" },
+                { value: "thisweek", label: "This Week" },
+                { value: "lastweek", label: "Last Week" },
+                { value: "thismonth", label: "This Month" },
+                { value: "lastmonth", label: "Last Month" },
+                { value: "thisyear", label: "This Year" },
                 { value: "overdue", label: "Overdue" },
-                { value: "next7", label: "Next 7 Days" },
+                { value: "custom", label: "Custom Range" },
+              ]}
+            />
+
+            <Select
+              label="Messages"
+              value={messageFilter}
+              onChange={(e) => setMessageFilter(e.target.value)}
+              options={[
+                { value: "all", label: "All Messages" },
+                { value: "unread", label: "Unread" },
+                { value: "read", label: "Read" },
               ]}
             />
 
@@ -1226,12 +1350,20 @@ export default function TasksPage() {
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value)}
               options={[
+                { value: "position", label: "Custom Order" },
                 { value: "newest", label: "Newest" },
                 { value: "oldest", label: "Oldest" },
                 { value: "due_soon", label: "Due Soon" },
                 { value: "priority", label: "Priority" },
               ]}
             />
+
+            {dateFilter === "custom" && (
+              <div className="col-span-1 flex items-end gap-2 md:col-span-2 xl:col-span-2">
+                <Input label="From" type="date" value={customDateFrom} onChange={(e) => setCustomDateFrom(e.target.value)} />
+                <Input label="To" type="date" value={customDateTo} onChange={(e) => setCustomDateTo(e.target.value)} />
+              </div>
+            )}
 
             <div className="flex items-end gap-2">
               <Button variant={viewMode === "list" ? "primary" : "outline"} size="sm" onClick={() => setViewMode("list")}>
@@ -1366,6 +1498,8 @@ export default function TasksPage() {
               { key: "team_all", label: "Team All" },
               { key: "all_pending", label: "All Pending" },
               { key: "approval_pending", label: "Approval Pending" },
+              { key: "my_approval_pending", label: "Need My Approval" },
+              { key: "other_approval_pending", label: "Others Approval" },
             ].map((item) => {
               const key = item.key as QuickFilter;
               const active = quickFilter === key;
@@ -1391,9 +1525,14 @@ export default function TasksPage() {
             <ListFilter className="h-4 w-4" />
             <span className="font-semibold">Smart Lists:</span>
             {[
-              { key: "none", label: "None" },
+              { key: "all", label: "All" },
+              { key: "today", label: "Today" },
+              { key: "upcoming", label: "Upcoming" },
               { key: "overdue", label: "Overdue" },
-              { key: "due_today", label: "Due Today" },
+              { key: "thisweek", label: "This Week" },
+              { key: "thismonth", label: "This Month" },
+              { key: "my_approval_pending", label: "My Approval Pending" },
+              { key: "other_approval_pending", label: "Other Approval Pending" },
               { key: "unassigned", label: "Unassigned" },
               { key: "queued", label: "Queued" },
               { key: "created_by_me", label: "Created By Me" },
@@ -1449,7 +1588,7 @@ export default function TasksPage() {
                       <div className="flex flex-wrap items-center gap-2">
                         <h3 className="font-semibold text-gray-900 dark:text-white">{task.title}</h3>
                         <Badge variant="outline">{task.task_status || "todo"}</Badge>
-                        <Badge variant={task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
+                        <Badge variant={task.priority === "urgent" ? "danger" : task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
                           {task.priority || "medium"}
                         </Badge>
                         {task.approval_status === "pending_approval" && <Badge variant="warning">Approval Pending</Badge>}
@@ -1576,7 +1715,7 @@ export default function TasksPage() {
                           <p className="line-clamp-2 text-sm font-semibold text-gray-900 dark:text-white">{task.title}</p>
                           <p className="mt-1 text-xs text-gray-500">{task.assigned_to || "Unassigned"}</p>
                           <div className="mt-2 flex items-center justify-between">
-                            <Badge variant={task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
+                            <Badge variant={task.priority === "urgent" ? "danger" : task.priority === "high" ? "danger" : task.priority === "low" ? "info" : "warning"}>
                               {task.priority || "medium"}
                             </Badge>
                             <span className="text-xs text-gray-500">{task.due_date ? formatDate(task.due_date) : "No due"}</span>
@@ -1633,6 +1772,7 @@ export default function TasksPage() {
             value={form.priority}
             onChange={(e) => setForm((p) => ({ ...p, priority: e.target.value as TaskForm["priority"] }))}
             options={[
+              { value: "urgent", label: "Urgent" },
               { value: "high", label: "High" },
               { value: "medium", label: "Medium" },
               { value: "low", label: "Low" },
