@@ -3,24 +3,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
-  ArrowRightLeft,
   CalendarDays,
   CheckCircle2,
   Clock3,
   CornerDownRight,
-  Columns3,
   Download,
-  Eye,
   Filter,
   ListFilter,
   Kanban,
   ListTodo,
   MessageSquare,
-  Pencil,
   Plus,
   Send,
-  Share2,
-  Trash2,
   UserCheck,
   XCircle,
 } from "lucide-react";
@@ -2006,59 +2000,39 @@ export default function TasksPage() {
 
                     <div className="flex flex-wrap items-start justify-end gap-1">
                       {isQueued && (
-                        <Button size="sm" variant="secondary" onClick={() => runTaskAction(task, "claim_queue")}>
-                          Pick Queue
-                        </Button>
+                        <button type="button" className="legacy-action-pill legacy-action-pick" onClick={() => runTaskAction(task, "claim_queue")}>📥 Pick</button>
                       )}
 
                       {(mine || isAdminLike(currentUser)) && task.task_status !== "in_progress" && !isDone(task) && (
-                        <Button size="sm" variant="outline" onClick={() => runTaskAction(task, "start")}>
-                          Start
-                        </Button>
+                        <button type="button" className="legacy-action-pill legacy-action-start" onClick={() => runTaskAction(task, "start")}>🚀 Start</button>
                       )}
 
                       {(mine || isAdminLike(currentUser)) && !isDone(task) && (
-                        <Button size="sm" variant="success" onClick={() => runTaskAction(task, "submit")}>
-                          Submit
-                        </Button>
+                        <button type="button" className="legacy-action-pill legacy-action-submit" onClick={() => runTaskAction(task, "submit")}>⚡ Submit</button>
                       )}
 
                       {canApprove && (
                         <>
-                          <Button size="sm" variant="success" onClick={() => runTaskAction(task, "approve")}>
-                            Approve
-                          </Button>
-                          <Button size="sm" variant="danger" onClick={() => { setDeclineTask(task); setDeclineReason(task.decline_reason || ""); }}>
-                            Decline
-                          </Button>
+                          <button type="button" className="legacy-action-pill legacy-action-approve" onClick={() => runTaskAction(task, "approve")}>👍 Approve</button>
+                          <button type="button" className="legacy-action-pill legacy-action-decline" onClick={() => { setDeclineTask(task); setDeclineReason(task.decline_reason || ""); }}>👎 Decline</button>
                         </>
                       )}
 
                       {!isDone(task) && (
-                        <Button size="sm" variant="outline" onClick={() => { setDelegateTask(task); setDelegateTarget(""); }}>
-                          <ArrowRightLeft className="h-4 w-4" />
-                        </Button>
+                        <button type="button" className="legacy-icon-chip legacy-icon-chip-neutral" onClick={() => { setDelegateTask(task); setDelegateTarget(""); }} title="Delegate">🔁</button>
                       )}
 
                       {isDone(task) && (
-                        <Button size="sm" variant="outline" onClick={() => runTaskAction(task, "reopen")}>
-                          Reopen
-                        </Button>
+                        <button type="button" className="legacy-action-pill legacy-action-reopen" onClick={() => runTaskAction(task, "reopen")}>↩️ Reopen</button>
                       )}
 
-                      <Button size="sm" variant="outline" onClick={() => setDetailTask(task)}>
-                        <Eye className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => openEditModal(task)}>
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => duplicateTask(task)} title="Duplicate">
-                        📋
-                      </Button>
+                      <button type="button" className="legacy-icon-chip legacy-icon-chip-view" onClick={() => setDetailTask(task)} title="View">👁️</button>
+                      <button type="button" className="legacy-icon-chip legacy-icon-chip-edit" onClick={() => openEditModal(task)} title="Edit">✏️</button>
+                      <button type="button" className="legacy-icon-chip legacy-icon-chip-dup" onClick={() => duplicateTask(task)} title="Duplicate">📋</button>
                       {!isDone(task) && (
-                        <Button
-                          size="sm"
-                          variant="outline"
+                        <button
+                          type="button"
+                          className="legacy-icon-chip legacy-icon-chip-date"
                           onClick={() => {
                             setUpdateDueTask(task);
                             setUpdatedDueDate(toInputDateTime(task.due_date));
@@ -2066,17 +2040,17 @@ export default function TasksPage() {
                           title="Update Due Date"
                         >
                           📅
-                        </Button>
+                        </button>
                       )}
                       {inlineEditId === task.id ? (
                         <>
-                          <Button size="sm" variant="success" onClick={() => saveInlineTask(task)}>Save</Button>
-                          <Button size="sm" variant="outline" onClick={() => setInlineEditId(null)}>Cancel</Button>
+                          <button type="button" className="legacy-action-pill legacy-action-approve" onClick={() => saveInlineTask(task)}>✅ Save</button>
+                          <button type="button" className="legacy-action-pill legacy-action-reopen" onClick={() => setInlineEditId(null)}>Cancel</button>
                         </>
                       ) : (
-                        <Button
-                          size="sm"
-                          variant="outline"
+                        <button
+                          type="button"
+                          className="legacy-action-pill legacy-action-reopen"
                           onClick={() => {
                             setInlineEditId(task.id);
                             setInlineTitle(task.title || "");
@@ -2084,17 +2058,11 @@ export default function TasksPage() {
                           }}
                         >
                           Quick Edit
-                        </Button>
+                        </button>
                       )}
-                      <Button size="sm" variant="outline" onClick={() => setShareTask(task)}>
-                        <Share2 className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => archiveTask(task.id)}>
-                        <Columns3 className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant="danger" onClick={() => deleteTask(task.id)}>
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
+                      <button type="button" className="legacy-icon-chip legacy-icon-chip-share" onClick={() => setShareTask(task)} title="Share">👥</button>
+                      <button type="button" className="legacy-icon-chip legacy-icon-chip-archive" onClick={() => archiveTask(task.id)} title="Archive">📦</button>
+                      <button type="button" className="legacy-icon-chip legacy-icon-chip-delete" onClick={() => deleteTask(task.id)} title="Delete">🗑️</button>
                     </div>
                   </div>
                 );
@@ -2218,9 +2186,10 @@ export default function TasksPage() {
           if (!editingTask) resetForm();
         }}
         title={editingTask ? "📝 Edit Task" : "📝 Add New Task"}
+        className="legacy-todo-modal"
         size="xl"
       >
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="legacy-task-form-grid grid gap-3 md:grid-cols-2">
           <Select
             label="App / Game Name"
             value={form.app_name}
@@ -2777,6 +2746,61 @@ export default function TasksPage() {
           box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
         }
 
+        .legacy-task-ui .legacy-action-pill {
+          height: 36px;
+          border: none;
+          border-radius: 10px;
+          padding: 0 14px;
+          font-size: 13px;
+          font-weight: 700;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+
+        .legacy-task-ui .legacy-action-pill:hover {
+          transform: scale(1.02);
+        }
+
+        .legacy-task-ui .legacy-action-pick { background: #0ea5e9; color: #fff; box-shadow: 0 2px 4px rgba(14,165,233,0.3); }
+        .legacy-task-ui .legacy-action-start { background: #10b981; color: #fff; box-shadow: 0 2px 4px rgba(16,185,129,0.3); }
+        .legacy-task-ui .legacy-action-submit { background: #8b5cf6; color: #fff; box-shadow: 0 2px 4px rgba(139,92,246,0.3); }
+        .legacy-task-ui .legacy-action-approve { background: #22c55e; color: #fff; box-shadow: 0 2px 4px rgba(34,197,94,0.3); }
+        .legacy-task-ui .legacy-action-decline { background: #ef4444; color: #fff; box-shadow: 0 2px 4px rgba(239,68,68,0.3); }
+        .legacy-task-ui .legacy-action-reopen { background: #e2e8f0; color: #475569; }
+
+        .legacy-task-ui .legacy-icon-chip {
+          width: 36px;
+          height: 36px;
+          border: none;
+          border-radius: 10px;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 16px;
+          transition: all 0.2s;
+        }
+
+        .legacy-task-ui .legacy-icon-chip-view { background: #e0f2fe; }
+        .legacy-task-ui .legacy-icon-chip-view:hover { background: #bae6fd; }
+        .legacy-task-ui .legacy-icon-chip-edit { background: #f1f5f9; }
+        .legacy-task-ui .legacy-icon-chip-edit:hover { background: #e2e8f0; }
+        .legacy-task-ui .legacy-icon-chip-dup { background: #f0f9ff; }
+        .legacy-task-ui .legacy-icon-chip-dup:hover { background: #dbeafe; }
+        .legacy-task-ui .legacy-icon-chip-date { background: #eef2ff; }
+        .legacy-task-ui .legacy-icon-chip-date:hover { background: #e0e7ff; }
+        .legacy-task-ui .legacy-icon-chip-share { background: #e0e7ff; }
+        .legacy-task-ui .legacy-icon-chip-share:hover { background: #c7d2fe; }
+        .legacy-task-ui .legacy-icon-chip-archive { background: #fef3c7; }
+        .legacy-task-ui .legacy-icon-chip-archive:hover { background: #fde68a; }
+        .legacy-task-ui .legacy-icon-chip-delete { background: #fef2f2; }
+        .legacy-task-ui .legacy-icon-chip-delete:hover { background: #fee2e2; }
+        .legacy-task-ui .legacy-icon-chip-neutral { background: #e2e8f0; }
+        .legacy-task-ui .legacy-icon-chip-neutral:hover { background: #cbd5e1; }
+
         .legacy-task-ui .legacy-list-task {
           border-radius: 10px;
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
@@ -2856,6 +2880,46 @@ export default function TasksPage() {
         .legacy-task-ui [role="dialog"] {
           border-radius: 12px;
           box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+        }
+
+        .legacy-task-ui .legacy-todo-modal {
+          border-radius: 12px;
+          overflow: hidden;
+        }
+
+        .legacy-task-ui .legacy-todo-modal > div:first-child {
+          background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+          color: #fff;
+          border-bottom: none;
+          padding: 24px 30px;
+        }
+
+        .legacy-task-ui .legacy-todo-modal > div:first-child h2 {
+          color: #fff;
+          font-size: 22px;
+          font-weight: 700;
+          letter-spacing: -0.2px;
+        }
+
+        .legacy-task-ui .legacy-todo-modal > div:first-child button {
+          background: rgba(255, 255, 255, 0.2);
+          color: #fff;
+          border-radius: 10px;
+          width: 36px;
+          height: 36px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 0;
+        }
+
+        .legacy-task-ui .legacy-todo-modal > div:last-child {
+          padding: 30px;
+        }
+
+        .legacy-task-ui .legacy-task-form-grid > div,
+        .legacy-task-ui .legacy-task-form-grid > label {
+          margin-bottom: 4px;
         }
       `}</style>
     </div>
