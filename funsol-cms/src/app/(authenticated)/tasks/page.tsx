@@ -247,6 +247,29 @@ function normalizeOptions(input: unknown): Array<{ value: string; label: string 
   return Array.from(dedup.values());
 }
 
+const ROUTE_META: Record<TaskForm["route_mode"], { emoji: string; title: string; subtitle: string }> = {
+  self: {
+    emoji: "📝",
+    title: "Self Todo",
+    subtitle: "Create this task for yourself",
+  },
+  department: {
+    emoji: "🏢",
+    title: "Send to Department",
+    subtitle: "Route to a department queue for auto-assignment",
+  },
+  manager: {
+    emoji: "👤",
+    title: "Send to Manager Directly",
+    subtitle: "Assign directly to a team manager",
+  },
+  multi: {
+    emoji: "👥",
+    title: "Multi-Assignment",
+    subtitle: "Send this task to multiple users at once",
+  },
+};
+
 export default function TasksPage() {
   const { data: session } = useSession();
   const me = (session?.user as { username?: string } | undefined)?.username || "";
@@ -1505,12 +1528,12 @@ export default function TasksPage() {
   }
 
   return (
-    <div className="space-y-6 p-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="legacy-task-ui space-y-6 p-6">
+      <div className="legacy-header flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50 via-white to-blue-50 p-4 dark:border-indigo-900/60 dark:from-indigo-950/30 dark:via-gray-900 dark:to-blue-950/20">
         <div>
           <h1 className="font-heading text-2xl font-bold text-gray-900 dark:text-white">Task Center</h1>
           <p className="text-sm text-gray-600 dark:text-gray-300">
-            Legacy workflow parity: quick filters, smart lists, list/kanban/calendar, routing, sharing, and approvals.
+            Same as legacy task module: filters, routing, queue, approvals, templates, and full workflows.
           </p>
         </div>
 
@@ -1526,7 +1549,7 @@ export default function TasksPage() {
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
         {kpis.map((k) => (
-          <Card key={k.title} className="border-gray-200 dark:border-gray-700">
+          <Card key={k.title} className="legacy-kpi-card border-gray-200 dark:border-gray-700">
             <CardContent className="flex items-center justify-between py-4">
               <div>
                 <p className="text-xs font-semibold uppercase text-gray-500">{k.title}</p>
@@ -1540,8 +1563,8 @@ export default function TasksPage() {
         ))}
       </div>
 
-      <Card>
-        <CardHeader className="flex flex-wrap items-center gap-3">
+      <Card className="legacy-panel">
+        <CardHeader className="legacy-panel-head flex flex-wrap items-center gap-3">
           <div className="min-w-[220px] flex-1">
             <Input
               label="Search"
@@ -1551,7 +1574,7 @@ export default function TasksPage() {
             />
           </div>
 
-          <div className="grid flex-[2] grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
+          <div className="legacy-filters grid flex-[2] grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
             <Select
               label="Quick Filter"
               value={quickFilter}
@@ -1643,7 +1666,7 @@ export default function TasksPage() {
           </div>
         </CardHeader>
 
-        <CardContent className="space-y-3">
+        <CardContent className="legacy-panel-body space-y-3">
           <div className="grid gap-2 rounded border border-gray-200 p-2 md:grid-cols-[1fr_220px_auto] dark:border-gray-700">
             <Input placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />
             <Select
@@ -2081,7 +2104,7 @@ export default function TasksPage() {
           setTaskModalOpen(false);
           if (!editingTask) resetForm();
         }}
-        title={editingTask ? "Edit Task" : "Create Task"}
+        title={editingTask ? "📝 Edit Task" : "📝 Add New Task"}
         size="xl"
       >
         <div className="grid gap-3 md:grid-cols-2">
@@ -2197,18 +2220,36 @@ export default function TasksPage() {
 
           <div className="grid gap-3 md:grid-cols-3">
             {metadata.routingModes.map((opt) => (
+              (() => {
+                const mode = opt.value as TaskForm["route_mode"];
+                const meta = ROUTE_META[mode] || {
+                  emoji: "➡️",
+                  title: opt.label,
+                  subtitle: "Route task",
+                };
+                return (
               <button
                 key={opt.value}
                 type="button"
                 onClick={() => setForm((p) => ({ ...p, route_mode: opt.value as TaskForm["route_mode"] }))}
-                className={`rounded border p-3 text-left text-sm ${
+                className={`legacy-route-card rounded-xl border p-3 text-left text-sm transition-all ${
                   form.route_mode === opt.value
                     ? "border-primary-500 bg-primary-50 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300"
                     : "border-gray-300 text-gray-700 dark:border-gray-600 dark:text-gray-300"
                 }`}
               >
-                <p className="font-semibold">{opt.label}</p>
+                <div className="flex items-center gap-3">
+                  <div className="legacy-route-emoji flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-100 to-blue-100 text-lg dark:from-indigo-900/50 dark:to-blue-900/40">
+                    {meta.emoji}
+                  </div>
+                  <div>
+                    <p className="font-semibold">{meta.title}</p>
+                    <p className="text-xs opacity-80">{meta.subtitle}</p>
+                  </div>
+                </div>
               </button>
+                );
+              })()
             ))}
           </div>
 
@@ -2479,6 +2520,59 @@ export default function TasksPage() {
           </div>
         </div>
       </Modal>
+
+      <style jsx global>{`
+        .legacy-task-ui {
+          --legacy-border: #e2e8f0;
+          --legacy-soft: #f8fafc;
+        }
+
+        .legacy-task-ui .legacy-panel {
+          border-radius: 16px;
+          border: 1px solid var(--legacy-border);
+          box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+        }
+
+        .legacy-task-ui .legacy-panel-head {
+          border-bottom: 1px solid var(--legacy-border);
+          background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+          border-top-left-radius: 16px;
+          border-top-right-radius: 16px;
+        }
+
+        .legacy-task-ui .legacy-panel-body {
+          background: #ffffff;
+          border-bottom-left-radius: 16px;
+          border-bottom-right-radius: 16px;
+        }
+
+        .legacy-task-ui .legacy-kpi-card {
+          border-radius: 14px;
+          background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+          box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05);
+        }
+
+        .legacy-task-ui .legacy-filters label {
+          font-weight: 700;
+        }
+
+        .legacy-task-ui .legacy-route-card {
+          background: #ffffff;
+          border-width: 2px;
+        }
+
+        .legacy-task-ui .legacy-route-card:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+        }
+
+        .legacy-task-ui button,
+        .legacy-task-ui input,
+        .legacy-task-ui select,
+        .legacy-task-ui textarea {
+          border-radius: 12px;
+        }
+      `}</style>
     </div>
   );
 }
